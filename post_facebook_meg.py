@@ -13,11 +13,25 @@ and the rclone config come from the GitHub Actions workflow. See the SHEET
 HEADER COLUMNS section below.
 
 SHEET HEADER COLUMNS (row 1 = headers, exact names, case-insensitive):
-  Caption               — the caption to post. It is NEVER cleared — the
-                           same caption row (row 2, first non-empty row)
-                           is reused every run. Each run, one or more URLs
-                           already inside the caption are swapped for fresh
-                           ones pulled from the 'Urls' tab (see below).
+  Caption               — the caption to post WHEN this run includes a
+                           link (see Link_Percentage below). It is NEVER
+                           cleared — the same caption row (row 2, first
+                           non-empty row) is reused every run. Each time
+                           it's used, one or more URLs already inside it
+                           are swapped for fresh ones pulled from the
+                           'Urls' tab (see below).
+  WithoutLinkCap         — a separate caption used WHEN this run is
+                           chosen (by Link_Percentage) to post WITHOUT a
+                           link. Also never cleared / reused every time.
+                           No URL swapping ever happens on this caption.
+                           Optional — if left blank, runs fall back to
+                           the regular 'Caption' (with link) instead.
+  Link_Percentage        — 0–100. Read from row 2 only. Defaults to 100
+                           (always post WITH a link). Each run rolls a
+                           random 1–100 number; if it's ≤ Link_Percentage,
+                           the 'Caption' (with link) is used, otherwise
+                           'WithoutLinkCap' is used. E.g. 30 → roughly
+                           30% of runs post with a link, 70% without.
   MegaFolder             — Mega.nz folder (path, relative to the mega
                            remote root) holding pending videos.
                            Read from row 2 only. Defaults to "fbreels"
@@ -32,7 +46,8 @@ SHEET HEADER COLUMNS (row 1 = headers, exact names, case-insensitive):
                            Read from row 2 only. Defaults to 300 if blank.
   UrlReplaceCount        — how many URLs *inside the caption* to replace
                            each run. Read from row 2 only. Defaults to 1.
-                           Ignored when UrlReplaceEnabled is FALSE.
+                           Only applies on runs using 'Caption' (with a
+                           link). Ignored when UrlReplaceEnabled is FALSE.
   UrlReplaceMode         — "unique" (default) or "same". Read from row 2
                            only. Ignored when UrlReplaceEnabled is FALSE.
                              unique — each URL occurrence in the caption
@@ -46,7 +61,7 @@ SHEET HEADER COLUMNS (row 1 = headers, exact names, case-insensitive):
                                       pulled, used twice).
   UrlReplaceEnabled      — TRUE (default) or FALSE. Read from row 2 only.
                            Set to FALSE to skip URL swapping entirely and
-                           post the caption exactly as written — the
+                           post the 'Caption' exactly as written — the
                            'Urls' tab is not touched or read in that case.
 
 'Urls' TAB (same spreadsheet, separate tab named exactly "Urls"):
@@ -59,7 +74,7 @@ SHEET HEADER COLUMNS (row 1 = headers, exact names, case-insensitive):
                            already there.
 """
 
-import asyncio, json, os, re, subprocess, sys, tempfile, time
+import asyncio, json, os, random, re, subprocess, sys, tempfile, time
 from pathlib import Path
 from datetime import datetime
 import functools
@@ -115,11 +130,13 @@ SETTINGS_COLUMNS = {
     "url_replace_count":     "UrlReplaceCount",
     "url_replace_mode":      "UrlReplaceMode",
     "url_replace_enabled":   "UrlReplaceEnabled",
+    "link_percentage":       "Link_Percentage",
 }
 
 DEFAULT_URL_REPLACE_COUNT   = 1
 DEFAULT_URL_REPLACE_MODE    = "unique"   # "unique" or "same"
 DEFAULT_URL_REPLACE_ENABLED = True
+DEFAULT_LINK_PERCENTAGE     = 100        # 100 = always post WITH a link (old behavior)
 
 # 'Urls' tab config
 URLS_SHEET_NAME         = "Urls"
@@ -343,17 +360,15 @@ def sheet_get_settings(sheets_service, spreadsheet_id: str) -> dict:
     return settings
 
 
-def sheet_get_caption(sheets_service, spreadsheet_id: str):
+def _sheet_get_named_column(sheets_service, spreadsheet_id: str, column_name: str, required: bool = True):
     """
-    Finds the 'Caption' column and returns the first non-empty caption
-    found below the header, along with its row/column index.
-
-    NOTE: the caption is intentionally NEVER cleared by this script
-    anymore — the same caption is reused on every run. Only the URL
-    inside it changes (see sheet_get_next_url / replace_url_in_caption).
-    Returns (caption, row_num, col_idx) or (None, None, None).
+    Generic helper: finds `column_name` (case-insensitive) in row 1 and
+    returns the first non-empty value found below it, along with its
+    row/column index. The cell is NEVER cleared here — callers reuse the
+    same value every run. Returns (value, row_num, col_idx) or
+    (None, None, None).
     """
-    step(f"Fetching caption from Google Sheet: {spreadsheet_id}")
+    step(f"Fetching '{column_name}' from Google Sheet: {spreadsheet_id}")
     rows = _read_sheet_rows(sheets_service, spreadsheet_id)
     if not rows:
         warn("Sheet appears empty")
@@ -364,24 +379,54 @@ def sheet_get_caption(sheets_service, spreadsheet_id: str):
 
     col_idx = None
     for i, h in enumerate(header):
-        if h.strip().lower() == "caption":
+        if h.strip().lower() == column_name.lower():
             col_idx = i
             break
 
     if col_idx is None:
-        fail("No 'Caption' column found in header row — check your sheet headers")
+        msg = f"No '{column_name}' column found in header row"
+        if required:
+            fail(msg)
+        else:
+            warn(msg)
         return None, None, None
 
-    info(f"'Caption' column found at index {col_idx} (column {chr(ord('A') + col_idx)})")
+    info(f"'{column_name}' column found at index {col_idx} (column {chr(ord('A') + col_idx)})")
 
     for row_num, row in enumerate(rows[1:], start=2):
         if len(row) > col_idx and row[col_idx].strip():
-            caption = row[col_idx].strip()
-            ok(f"Caption found at row {row_num}: {caption[:80]}")
-            return caption, row_num, col_idx
+            value = row[col_idx].strip()
+            ok(f"'{column_name}' found at row {row_num}: {value[:80]}")
+            return value, row_num, col_idx
 
-    warn("No caption found in sheet (all rows empty)")
+    warn(f"No value found in '{column_name}' column (all rows empty)")
     return None, None, None
+
+
+def sheet_get_caption(sheets_service, spreadsheet_id: str):
+    """
+    Finds the 'Caption' column and returns the first non-empty caption
+    found below the header, along with its row/column index. This is the
+    caption used on runs that post WITH a link.
+
+    NOTE: the caption is intentionally NEVER cleared by this script
+    anymore — the same caption is reused on every run. Only the URL(s)
+    inside it change (see sheet_get_next_urls / replace_urls_in_caption).
+    Returns (caption, row_num, col_idx) or (None, None, None).
+    """
+    return _sheet_get_named_column(sheets_service, spreadsheet_id, "Caption", required=True)
+
+
+def sheet_get_withoutlink_caption(sheets_service, spreadsheet_id: str):
+    """
+    Finds the 'WithoutLinkCap' column and returns the first non-empty
+    value found below it — the caption used on runs that post WITHOUT a
+    link (chosen via Link_Percentage). Optional column: if it's missing
+    or empty, callers should fall back to the regular 'Caption'. Never
+    cleared, same value reused every time it's picked.
+    Returns (caption, row_num, col_idx) or (None, None, None).
+    """
+    return _sheet_get_named_column(sheets_service, spreadsheet_id, "WithoutLinkCap", required=False)
 
 
 def sheet_get_next_urls(sheets_service, spreadsheet_id: str, count: int):
@@ -1454,18 +1499,41 @@ def run_once():
     info(f"Mega.nz source folder: {mega_folder}")
     info(f"Mega.nz move-to-uploaded folder: {mega_move_folder}")
 
-    # Caption is reused every run — it is never cleared.
-    caption, cap_row, cap_col = sheet_get_caption(sheets_service, captions_sheet_id)
-    if not caption:
-        fail("No caption available in the Google Sheet — aborting this run "
-             "(add a value to the 'Caption' column)")
-        return
+    # ── Decide WITH-link vs WITHOUT-link caption for this run ───────────
+    link_percentage = _to_int(settings.get("link_percentage"), DEFAULT_LINK_PERCENTAGE)
+    link_percentage = max(0, min(100, link_percentage))
+    roll = random.randint(1, 100)
+    use_link_caption = roll <= link_percentage
+    info(f"Link_Percentage={link_percentage}% — roll={roll}/100 → "
+         f"{'WITH link (Caption)' if use_link_caption else 'WITHOUT link (WithoutLinkCap)'}")
 
-    # ── URL replacement settings ────────────────────────────────────────
-    url_replace_enabled = _to_bool(settings.get("url_replace_enabled"), DEFAULT_URL_REPLACE_ENABLED)
+    if use_link_caption:
+        caption, cap_row, cap_col = sheet_get_caption(sheets_service, captions_sheet_id)
+        if not caption:
+            fail("No caption available in the Google Sheet — aborting this run "
+                 "(add a value to the 'Caption' column)")
+            return
+    else:
+        caption, cap_row, cap_col = sheet_get_withoutlink_caption(sheets_service, captions_sheet_id)
+        if not caption:
+            warn("'WithoutLinkCap' column is empty or missing — falling back to the "
+                 "regular 'Caption' (with link) for this run instead")
+            use_link_caption = True
+            caption, cap_row, cap_col = sheet_get_caption(sheets_service, captions_sheet_id)
+            if not caption:
+                fail("No caption available in the Google Sheet — aborting this run "
+                     "(add a value to the 'Caption' or 'WithoutLinkCap' column)")
+                return
+
+    # ── URL replacement settings (only ever applies to the WITH-link caption) ─
+    url_replace_enabled = use_link_caption and _to_bool(
+        settings.get("url_replace_enabled"), DEFAULT_URL_REPLACE_ENABLED
+    )
     new_urls, used_rows, url_col_idx, status_col_idx = [], [], None, None
 
-    if not url_replace_enabled:
+    if not use_link_caption:
+        info("Posting WITHOUT a link this run — 'Urls' tab not touched")
+    elif not url_replace_enabled:
         info("UrlReplaceEnabled is FALSE — posting caption as-is, 'Urls' tab not touched")
     else:
         url_replace_count = _to_int(settings.get("url_replace_count"), DEFAULT_URL_REPLACE_COUNT)
@@ -1538,7 +1606,8 @@ def run_once():
         # so the same caption (with fresh URL(s)) is used again next run.
         if new_urls and used_rows:
             sheet_mark_urls_status(sheets_service, captions_sheet_id, used_rows, status_col_idx, "Posted")
-        info("Caption left in sheet (not cleared) — will be reused next run with new URL(s)")
+        info(f"Caption left in sheet (not cleared) — will be reused next run "
+             f"({'with fresh URL(s)' if use_link_caption else 'no link'})")
     else:
         warn("Upload not confirmed — video stays in the Mega.nz source folder for retry, "
              "caption left untouched and no URLs marked as Posted")
