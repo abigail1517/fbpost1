@@ -95,7 +95,7 @@ jobs:
           CAPTIONS_SHEET_ID:       ${{ inputs.captions_sheet_id }}
         run: |
           echo "🔁 Starting loop — timing is controlled by the Google Sheet"
-          python post_facebookme.py
+          python post_facebookmeg.py
           echo "⏹️  Loop window finished"
 
       # ── 7. Refresh FB session secret ─────────────────────────────────────
