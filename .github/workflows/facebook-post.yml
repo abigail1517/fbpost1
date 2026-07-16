@@ -3,38 +3,19 @@ name: Facebook Reel Upload (Loop)
 on:
   workflow_dispatch:
     inputs:
-      gdrive_upload_folder_id:
-        description: "Google Drive folder ID holding pending videos"
-        required: true
-        type: string
-      gdrive_uploaded_folder_id:
-        description: "Google Drive folder ID to move videos to after a successful upload"
-        required: true
-        type: string
       captions_sheet_id:
-        description: "Google Sheet ID with a 'Caption' column (defaults to the shared sheet if left blank)"
+        description: "Google Sheet ID holding Caption / UploadFolderID / UploadedFolderID / LoopIntervalMinutes / MaxRuntimeMinutes (defaults to the shared sheet if left blank)"
         required: false
         default: "1ICgS97JJ-Hrs9qsI1UV-xJvPg7ovmSHStGQPoOYr0Dk"
-        type: string
-      loop_interval_minutes:
-        description: "Minutes between posts (default: 30)"
-        required: false
-        default: "30"
-        type: string
-      # GitHub Actions jobs time out after 6 hours max.
-      # This input controls how many TOTAL minutes the loop runs before
-      # the job exits cleanly and re-queues itself.  Keep this well under
-      # 360 (6 h) to leave headroom for the last upload to finish.
-      max_runtime_minutes:
-        description: "Total minutes this job should run before self-requeuing (max ~330)"
-        required: false
-        default: "300"
         type: string
 
 jobs:
   upload-reel-loop:
     runs-on: ubuntu-latest
-    # Hard ceiling — GitHub kills jobs at 6 h; we exit cleanly at 5 h 30 m
+    # Hard technical ceiling — GitHub kills jobs at 6 h no matter what.
+    # The script itself exits earlier, based on MaxRuntimeMinutes in the
+    # sheet; this is just a backstop so a bad/missing sheet value can
+    # never make the job run into GitHub's own limit.
     timeout-minutes: 330
 
     steps:
@@ -60,15 +41,12 @@ jobs:
         env:
           FB_STORAGE_STATE:       ${{ secrets.FB_STORAGE_STATE }}
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
-          GDRIVE_UPLOAD_FOLDER_ID: ${{ inputs.gdrive_upload_folder_id }}
-          GDRIVE_UPLOADED_FOLDER_ID: ${{ inputs.gdrive_uploaded_folder_id }}
         run: |
           echo "📁 Workspace contents:"
           ls -lh
           echo ""
-          echo "Checking required inputs…"
-          for VAR_NAME in FB_STORAGE_STATE GOOGLE_CREDENTIALS_JSON \
-                          GDRIVE_UPLOAD_FOLDER_ID GDRIVE_UPLOADED_FOLDER_ID; do
+          echo "Checking required secrets…"
+          for VAR_NAME in FB_STORAGE_STATE GOOGLE_CREDENTIALS_JSON; do
             VAL="${!VAR_NAME}"
             if [ -n "$VAL" ]; then
               echo "✅ $VAR_NAME is set"
@@ -76,32 +54,26 @@ jobs:
               echo "❌ $VAR_NAME is MISSING"
             fi
           done
-          echo "📝 Captions sheet : ${{ inputs.captions_sheet_id }}"
-          echo "⏱️  Loop interval : ${{ inputs.loop_interval_minutes }} minute(s)"
-          echo "⏱️  Max runtime   : ${{ inputs.max_runtime_minutes }} minute(s)"
+          echo "📝 Captions/settings sheet: ${{ inputs.captions_sheet_id }}"
+          echo "ℹ️  Upload folder, uploaded folder, loop interval, and max runtime"
+          echo "   are all read from that sheet's row 2 at runtime."
 
       # ── 5. Run the loop ──────────────────────────────────────────────────
       #
-      # The Python scheduler runs forever by design.  We wrap it with the
-      # `timeout` command so it exits cleanly after max_runtime_minutes,
-      # then the "Self-requeue" step below triggers a fresh workflow run so
-      # the loop continues without interruption.
+      # The Python scheduler reads LoopIntervalMinutes / MaxRuntimeMinutes
+      # from the sheet itself and exits cleanly once that window elapses.
+      # The "Self-requeue" step below then triggers a fresh workflow run
+      # so posting continues without interruption.
       #
       - name: Run upload loop
         env:
           TZ:                      "Asia/Karachi"
           FB_STORAGE_STATE:        ${{ secrets.FB_STORAGE_STATE }}
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
-          GDRIVE_UPLOAD_FOLDER_ID: ${{ inputs.gdrive_upload_folder_id }}
-          GDRIVE_UPLOADED_FOLDER_ID: ${{ inputs.gdrive_uploaded_folder_id }}
           CAPTIONS_SHEET_ID:       ${{ inputs.captions_sheet_id }}
-          LOOP_INTERVAL_MINUTES:   ${{ inputs.loop_interval_minutes }}
-        # `timeout` exits with code 124 when time expires — that is expected,
-        # so we append `|| true` to prevent the step from failing the job.
         run: |
-          SECONDS=$(( ${{ inputs.max_runtime_minutes }} * 60 ))
-          echo "🔁 Starting loop — will run for up to ${SECONDS}s then self-requeue"
-          timeout ${SECONDS} python post_facebook.py || true
+          echo "🔁 Starting loop — timing is controlled by the Google Sheet"
+          python post_facebook.py
           echo "⏹️  Loop window finished"
 
       # ── 6. Refresh FB session secret ─────────────────────────────────────
@@ -134,7 +106,7 @@ jobs:
       # ── 8. Self-requeue — keep the loop alive across job boundaries ───────
       #
       # After the loop window ends, we trigger a new workflow_dispatch run
-      # with the same inputs so posting continues seamlessly.
+      # with the same sheet ID so posting continues seamlessly.
       #
       # Requires the GH_PAT secret (fine-grained PAT with
       # "Actions: Read & Write" permission on this repo).
@@ -158,10 +130,6 @@ jobs:
             "${{ github.workflow }}" \
             --repo "${{ github.repository }}" \
             --ref "${{ github.ref_name }}" \
-            --field gdrive_upload_folder_id="${{ inputs.gdrive_upload_folder_id }}" \
-            --field gdrive_uploaded_folder_id="${{ inputs.gdrive_uploaded_folder_id }}" \
-            --field captions_sheet_id="${{ inputs.captions_sheet_id }}" \
-            --field loop_interval_minutes="${{ inputs.loop_interval_minutes }}" \
-            --field max_runtime_minutes="${{ inputs.max_runtime_minutes }}"
+            --field captions_sheet_id="${{ inputs.captions_sheet_id }}"
 
           echo "✅ Next job queued — loop will continue uninterrupted"
