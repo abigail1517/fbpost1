@@ -26,8 +26,9 @@ SHEET HEADER COLUMNS (row 1 = headers, exact names, case-insensitive):
                            Read from row 2 only. Defaults to 300 if blank.
   UrlReplaceCount        — how many URLs *inside the caption* to replace
                            each run. Read from row 2 only. Defaults to 1.
+                           Ignored when UrlReplaceEnabled is FALSE.
   UrlReplaceMode         — "unique" (default) or "same". Read from row 2
-                           only.
+                           only. Ignored when UrlReplaceEnabled is FALSE.
                              unique — each URL occurrence in the caption
                                       gets its OWN distinct URL from the
                                       'Urls' tab (e.g. 2 occurrences → 2
@@ -37,6 +38,10 @@ SHEET HEADER COLUMNS (row 1 = headers, exact names, case-insensitive):
                                       single URL pulled from the 'Urls'
                                       tab (e.g. 2 occurrences → 1 URL
                                       pulled, used twice).
+  UrlReplaceEnabled      — TRUE (default) or FALSE. Read from row 2 only.
+                           Set to FALSE to skip URL swapping entirely and
+                           post the caption exactly as written — the
+                           'Urls' tab is not touched or read in that case.
 
 'Urls' TAB (same spreadsheet, separate tab named exactly "Urls"):
   Urls                   — one URL per row.
@@ -99,10 +104,12 @@ SETTINGS_COLUMNS = {
     "max_runtime_minutes":   "MaxRuntimeMinutes",
     "url_replace_count":     "UrlReplaceCount",
     "url_replace_mode":      "UrlReplaceMode",
+    "url_replace_enabled":   "UrlReplaceEnabled",
 }
 
-DEFAULT_URL_REPLACE_COUNT = 1
-DEFAULT_URL_REPLACE_MODE  = "unique"   # "unique" or "same"
+DEFAULT_URL_REPLACE_COUNT   = 1
+DEFAULT_URL_REPLACE_MODE    = "unique"   # "unique" or "same"
+DEFAULT_URL_REPLACE_ENABLED = True
 
 # 'Urls' tab config
 URLS_SHEET_NAME         = "Urls"
@@ -532,6 +539,17 @@ def _to_int(val, default):
         return int(str(val).strip())
     except (TypeError, ValueError):
         return default
+
+
+def _to_bool(val, default):
+    if val is None:
+        return default
+    s = str(val).strip().lower()
+    if s in ("true", "yes", "y", "1", "on", "enable", "enabled"):
+        return True
+    if s in ("false", "no", "n", "0", "off", "disable", "disabled"):
+        return False
+    return default
 
 
 def fetch_loop_timing():
@@ -1427,35 +1445,41 @@ def run_once():
         return
 
     # ── URL replacement settings ────────────────────────────────────────
-    url_replace_count = _to_int(settings.get("url_replace_count"), DEFAULT_URL_REPLACE_COUNT)
-    url_replace_mode = (settings.get("url_replace_mode") or DEFAULT_URL_REPLACE_MODE).strip().lower()
-    if url_replace_mode not in ("unique", "same"):
-        warn(f"Unknown UrlReplaceMode '{url_replace_mode}' — defaulting to 'unique'")
-        url_replace_mode = "unique"
-    info(f"URL replace settings: UrlReplaceCount={url_replace_count}, UrlReplaceMode={url_replace_mode}")
+    url_replace_enabled = _to_bool(settings.get("url_replace_enabled"), DEFAULT_URL_REPLACE_ENABLED)
+    new_urls, used_rows, url_col_idx, status_col_idx = [], [], None, None
 
-    # How many URL occurrences actually exist in the caption right now
-    n_matches = len(URL_REGEX.findall(caption))
-    n_to_replace = min(url_replace_count, n_matches) if n_matches else url_replace_count
-
-    # "same" mode only ever needs ONE URL pulled from the sheet, no matter
-    # how many occurrences it gets stamped into. "unique" mode needs one
-    # distinct URL per occurrence being replaced.
-    fetch_count = 1 if url_replace_mode == "same" else max(n_to_replace, 1)
-
-    new_urls, used_rows, url_col_idx, status_col_idx = sheet_get_next_urls(
-        sheets_service, captions_sheet_id, fetch_count
-    )
-
-    if new_urls:
-        if url_replace_mode == "unique" and len(new_urls) < n_to_replace:
-            warn(f"Only {len(new_urls)} unused URL(s) available — replacing "
-                 f"{len(new_urls)} instead of {n_to_replace}")
-            n_to_replace = len(new_urls)
-        caption = replace_urls_in_caption(caption, new_urls, url_replace_mode, n_to_replace)
+    if not url_replace_enabled:
+        info("UrlReplaceEnabled is FALSE — posting caption as-is, 'Urls' tab not touched")
     else:
-        warn(f"No unused URLs available in the '{URLS_SHEET_NAME}' tab — "
-             f"posting caption without swapping any URL")
+        url_replace_count = _to_int(settings.get("url_replace_count"), DEFAULT_URL_REPLACE_COUNT)
+        url_replace_mode = (settings.get("url_replace_mode") or DEFAULT_URL_REPLACE_MODE).strip().lower()
+        if url_replace_mode not in ("unique", "same"):
+            warn(f"Unknown UrlReplaceMode '{url_replace_mode}' — defaulting to 'unique'")
+            url_replace_mode = "unique"
+        info(f"URL replace settings: UrlReplaceCount={url_replace_count}, UrlReplaceMode={url_replace_mode}")
+
+        # How many URL occurrences actually exist in the caption right now
+        n_matches = len(URL_REGEX.findall(caption))
+        n_to_replace = min(url_replace_count, n_matches) if n_matches else url_replace_count
+
+        # "same" mode only ever needs ONE URL pulled from the sheet, no matter
+        # how many occurrences it gets stamped into. "unique" mode needs one
+        # distinct URL per occurrence being replaced.
+        fetch_count = 1 if url_replace_mode == "same" else max(n_to_replace, 1)
+
+        new_urls, used_rows, url_col_idx, status_col_idx = sheet_get_next_urls(
+            sheets_service, captions_sheet_id, fetch_count
+        )
+
+        if new_urls:
+            if url_replace_mode == "unique" and len(new_urls) < n_to_replace:
+                warn(f"Only {len(new_urls)} unused URL(s) available — replacing "
+                     f"{len(new_urls)} instead of {n_to_replace}")
+                n_to_replace = len(new_urls)
+            caption = replace_urls_in_caption(caption, new_urls, url_replace_mode, n_to_replace)
+        else:
+            warn(f"No unused URLs available in the '{URLS_SHEET_NAME}' tab — "
+                 f"posting caption without swapping any URL")
 
     try:
         videos = gdrive_list_videos(service, upload_folder)
