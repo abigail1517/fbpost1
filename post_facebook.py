@@ -12,9 +12,9 @@ GitHub Actions workflow anymore. See the SHEET HEADER COLUMNS section below.
 SHEET HEADER COLUMNS (row 1 = headers, exact names, case-insensitive):
   Caption               — the caption to post. It is NEVER cleared — the
                            same caption row (row 2, first non-empty row)
-                           is reused every run. Each run, one URL from the
-                           'Urls' tab is swapped into the caption before
-                           posting (see below).
+                           is reused every run. Each run, one or more URLs
+                           already inside the caption are swapped for fresh
+                           ones pulled from the 'Urls' tab (see below).
   UploadFolderID         — Drive folder ID holding pending videos.
                            Read from row 2 only.
   UploadedFolderID        — Drive folder ID videos get moved to after a
@@ -24,14 +24,28 @@ SHEET HEADER COLUMNS (row 1 = headers, exact names, case-insensitive):
   MaxRuntimeMinutes      — total minutes this job runs before exiting
                            cleanly so the workflow can self-requeue.
                            Read from row 2 only. Defaults to 300 if blank.
+  UrlReplaceCount        — how many URLs *inside the caption* to replace
+                           each run. Read from row 2 only. Defaults to 1.
+  UrlReplaceMode         — "unique" (default) or "same". Read from row 2
+                           only.
+                             unique — each URL occurrence in the caption
+                                      gets its OWN distinct URL from the
+                                      'Urls' tab (e.g. 2 occurrences → 2
+                                      different URLs pulled).
+                             same   — all targeted occurrences in the
+                                      caption are replaced with the SAME
+                                      single URL pulled from the 'Urls'
+                                      tab (e.g. 2 occurrences → 1 URL
+                                      pulled, used twice).
 
 'Urls' TAB (same spreadsheet, separate tab named exactly "Urls"):
-  Urls                   — one URL per row. Each run, the first non-empty
-                           URL is taken, swapped into the caption (replacing
-                           whatever URL already appears in the caption, or
-                           appended if the caption has none), and that cell
-                           is then cleared so it isn't reused on the next run.
-                           The Caption cell itself is left untouched.
+  Urls                   — one URL per row.
+  Status                 — left blank for unused URLs. After a URL is used
+                           in a successful post, this script writes
+                           "Posted" into this column for that row so the
+                           URL is skipped on future runs (it is never
+                           deleted). Add this header yourself if it isn't
+                           already there.
 """
 
 import asyncio, io, json, os, re, sys, tempfile, time
@@ -83,12 +97,19 @@ SETTINGS_COLUMNS = {
     "uploaded_folder_id":    "UploadedFolderID",
     "loop_interval_minutes": "LoopIntervalMinutes",
     "max_runtime_minutes":   "MaxRuntimeMinutes",
+    "url_replace_count":     "UrlReplaceCount",
+    "url_replace_mode":      "UrlReplaceMode",
 }
 
+DEFAULT_URL_REPLACE_COUNT = 1
+DEFAULT_URL_REPLACE_MODE  = "unique"   # "unique" or "same"
+
 # 'Urls' tab config
-URLS_SHEET_NAME  = "Urls"
-URLS_COLUMN_NAME = "Urls"
-URL_REGEX        = re.compile(r'https?://\S+')
+URLS_SHEET_NAME         = "Urls"
+URLS_COLUMN_NAME        = "Urls"
+URLS_STATUS_COLUMN_NAME = "Status"
+URLS_POSTED_VALUES      = {"posted", "replaced"}  # values treated as "already used"
+URL_REGEX                = re.compile(r'https?://\S+')
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP LOGGER
@@ -334,73 +355,158 @@ def sheet_get_caption(sheets_service, spreadsheet_id: str):
     return None, None, None
 
 
-def sheet_get_next_url(sheets_service, spreadsheet_id: str):
+def sheet_get_next_urls(sheets_service, spreadsheet_id: str, count: int):
     """
-    Reads the 'Urls' tab (same spreadsheet) and returns the first
-    non-empty URL found in the 'Urls' column, along with its row/column
-    index so it can be removed after use.
-    Returns (url, row_num, col_idx) or (None, None, None).
-    """
-    step(f"Fetching next URL from '{URLS_SHEET_NAME}' tab")
-    range_str = f"'{URLS_SHEET_NAME}'!A:Z"
-    rows = _read_sheet_rows(sheets_service, spreadsheet_id, range_str)
-    if not rows:
-        warn(f"'{URLS_SHEET_NAME}' tab appears empty or missing")
-        return None, None, None
+    Reads the 'Urls' tab (same spreadsheet) and returns up to `count`
+    unused URLs — rows whose 'Status' column is NOT "Posted"/"Replaced" —
+    in sheet order, along with their row numbers and the detected column
+    indices, so callers can mark them as used afterwards. URL rows are
+    never deleted or cleared; only their Status cell gets written to.
 
-    header = rows[0]
+    Returns (urls, rows, url_col_idx, status_col_idx):
+      urls           — list[str] of up to `count` unused URLs
+      rows           — list[int] matching row numbers for those URLs
+      url_col_idx    — column index of the 'Urls' column (or None if missing)
+      status_col_idx — column index of the 'Status' column (or None if missing)
+    """
+    step(f"Fetching up to {count} unused URL(s) from '{URLS_SHEET_NAME}' tab")
+    range_str = f"'{URLS_SHEET_NAME}'!A:Z"
+    rows_data = _read_sheet_rows(sheets_service, spreadsheet_id, range_str)
+    if not rows_data:
+        warn(f"'{URLS_SHEET_NAME}' tab appears empty or missing")
+        return [], [], None, None
+
+    header = rows_data[0]
     info(f"Header row ({URLS_SHEET_NAME}): {header}")
 
-    col_idx = None
+    url_col_idx = None
+    status_col_idx = None
     for i, h in enumerate(header):
-        if h.strip().lower() == URLS_COLUMN_NAME.lower():
-            col_idx = i
-            break
+        hl = h.strip().lower()
+        if hl == URLS_COLUMN_NAME.lower():
+            url_col_idx = i
+        elif hl == URLS_STATUS_COLUMN_NAME.lower():
+            status_col_idx = i
 
-    if col_idx is None:
+    if url_col_idx is None:
         fail(f"No '{URLS_COLUMN_NAME}' column found in '{URLS_SHEET_NAME}' tab header row")
-        return None, None, None
+        return [], [], None, None
 
-    info(f"'{URLS_COLUMN_NAME}' column found at index {col_idx} "
-         f"(column {chr(ord('A') + col_idx)})")
+    info(f"'{URLS_COLUMN_NAME}' column at index {url_col_idx} "
+         f"(column {chr(ord('A') + url_col_idx)})")
 
-    for row_num, row in enumerate(rows[1:], start=2):
-        if len(row) > col_idx and row[col_idx].strip():
-            url = row[col_idx].strip()
-            ok(f"URL found at row {row_num}: {url}")
-            return url, row_num, col_idx
-
-    warn(f"No unused URL found in '{URLS_SHEET_NAME}' tab (all rows empty)")
-    return None, None, None
-
-
-def sheet_clear_url(sheets_service, spreadsheet_id: str, row_num: int, col_idx: int):
-    """Clears the used URL cell in the 'Urls' tab so it isn't reused next run."""
-    step(f"Removing used URL at '{URLS_SHEET_NAME}' row {row_num}")
-    try:
-        col_letter = chr(ord('A') + col_idx)
-        cell_range = f"'{URLS_SHEET_NAME}'!{col_letter}{row_num}"
-        sheets_service.spreadsheets().values().clear(
-            spreadsheetId=spreadsheet_id, range=cell_range, body={}
-        ).execute()
-        ok(f"URL cell {cell_range} cleared")
-    except Exception as e:
-        warn(f"Could not clear URL cell: {e}")
-
-
-def replace_url_in_caption(caption: str, new_url: str) -> str:
-    """
-    Finds the first URL already inside the caption and swaps it for
-    new_url. If the caption has no URL in it, new_url is appended on its
-    own line instead so it still ends up in the post.
-    """
-    if URL_REGEX.search(caption):
-        updated = URL_REGEX.sub(new_url, caption, count=1)
-        ok("Replaced existing URL inside caption with new URL")
-        return updated
+    if status_col_idx is None:
+        warn(f"No '{URLS_STATUS_COLUMN_NAME}' column found in '{URLS_SHEET_NAME}' tab — "
+             f"add a '{URLS_STATUS_COLUMN_NAME}' header so used URLs can be skipped "
+             f"next time. Continuing without status tracking for now.")
     else:
-        warn("Caption had no URL to replace — appending new URL instead")
-        return f"{caption}\n{new_url}"
+        info(f"'{URLS_STATUS_COLUMN_NAME}' column at index {status_col_idx} "
+             f"(column {chr(ord('A') + status_col_idx)})")
+
+    found_urls, found_rows = [], []
+    for row_num, row in enumerate(rows_data[1:], start=2):
+        if len(found_urls) >= count:
+            break
+        if len(row) <= url_col_idx or not row[url_col_idx].strip():
+            continue
+        status_val = ""
+        if status_col_idx is not None and len(row) > status_col_idx:
+            status_val = row[status_col_idx].strip().lower()
+        if status_val in URLS_POSTED_VALUES:
+            continue
+        url = row[url_col_idx].strip()
+        found_urls.append(url)
+        found_rows.append(row_num)
+        info(f"  Selected URL row {row_num}: {url}")
+
+    if not found_urls:
+        warn(f"No unused URL found in '{URLS_SHEET_NAME}' tab (all marked "
+             f"'{URLS_STATUS_COLUMN_NAME}' or empty)")
+    else:
+        ok(f"Selected {len(found_urls)} unused URL(s) (requested {count})")
+
+    return found_urls, found_rows, url_col_idx, status_col_idx
+
+
+def sheet_mark_urls_status(sheets_service, spreadsheet_id: str, rows: list[int],
+                            status_col_idx, status_value: str = "Posted"):
+    """
+    Writes status_value into the 'Status' cell for each given row number in
+    the 'Urls' tab, so those URLs are skipped on future runs. The URL cell
+    itself is left untouched.
+    """
+    if not rows:
+        return
+    if status_col_idx is None:
+        warn(f"Cannot mark URL(s) as '{status_value}' — no '{URLS_STATUS_COLUMN_NAME}' "
+             f"column in '{URLS_SHEET_NAME}' tab (add one to enable status tracking)")
+        return
+
+    step(f"Marking {len(rows)} URL row(s) as '{status_value}' in '{URLS_SHEET_NAME}' tab")
+    col_letter = chr(ord('A') + status_col_idx)
+    for row_num in rows:
+        try:
+            cell_range = f"'{URLS_SHEET_NAME}'!{col_letter}{row_num}"
+            sheets_service.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=cell_range,
+                valueInputOption="RAW",
+                body={"values": [[status_value]]},
+            ).execute()
+            ok(f"Marked {cell_range} = {status_value}")
+        except Exception as e:
+            warn(f"Could not mark row {row_num} as '{status_value}': {e}")
+
+
+def replace_urls_in_caption(caption: str, new_urls: list[str], mode: str, replace_count: int) -> str:
+    """
+    Replaces up to `replace_count` URL occurrences already inside the
+    caption (in the order they appear) with URLs from new_urls.
+
+      mode == "unique" — occurrence i is replaced with new_urls[i]
+                          (each occurrence gets its own distinct URL).
+      mode == "same"   — every targeted occurrence is replaced with
+                          new_urls[0] (a single URL reused everywhere).
+
+    If the caption has no URL at all, the new URL(s) are appended on
+    their own lines instead so they still end up in the post:
+      mode == "same"   → appends new_urls[0] once
+      mode == "unique" → appends up to replace_count of new_urls
+    """
+    if not new_urls:
+        warn("No new URLs supplied — caption left unchanged")
+        return caption
+
+    matches = list(URL_REGEX.finditer(caption))
+
+    if not matches:
+        warn("Caption had no existing URL(s) to replace — appending new URL(s) instead")
+        if mode == "same":
+            return f"{caption}\n{new_urls[0]}"
+        return caption + "\n" + "\n".join(new_urls[:replace_count])
+
+    n_to_replace = min(replace_count, len(matches))
+    if n_to_replace < replace_count:
+        warn(f"Caption only contains {len(matches)} URL(s) — replacing {n_to_replace} "
+             f"instead of the requested {replace_count}")
+
+    pieces = []
+    last_end = 0
+    for i, m in enumerate(matches):
+        pieces.append(caption[last_end:m.start()])
+        if i < n_to_replace:
+            if mode == "same":
+                pieces.append(new_urls[0])
+            else:
+                pieces.append(new_urls[i] if i < len(new_urls) else m.group(0))
+        else:
+            pieces.append(m.group(0))
+        last_end = m.end()
+    pieces.append(caption[last_end:])
+
+    updated = "".join(pieces)
+    ok(f"Replaced {n_to_replace} URL occurrence(s) in caption (mode={mode})")
+    return updated
 
 
 def sheet_clear_caption(sheets_service, spreadsheet_id: str, row_num: int, col_idx: int):
@@ -1320,13 +1426,36 @@ def run_once():
              "(add a value to the 'Caption' column)")
         return
 
-    # Pull the next unused URL from the 'Urls' tab and swap it into the caption.
-    next_url, url_row, url_col = sheet_get_next_url(sheets_service, captions_sheet_id)
-    if next_url:
-        caption = replace_url_in_caption(caption, next_url)
+    # ── URL replacement settings ────────────────────────────────────────
+    url_replace_count = _to_int(settings.get("url_replace_count"), DEFAULT_URL_REPLACE_COUNT)
+    url_replace_mode = (settings.get("url_replace_mode") or DEFAULT_URL_REPLACE_MODE).strip().lower()
+    if url_replace_mode not in ("unique", "same"):
+        warn(f"Unknown UrlReplaceMode '{url_replace_mode}' — defaulting to 'unique'")
+        url_replace_mode = "unique"
+    info(f"URL replace settings: UrlReplaceCount={url_replace_count}, UrlReplaceMode={url_replace_mode}")
+
+    # How many URL occurrences actually exist in the caption right now
+    n_matches = len(URL_REGEX.findall(caption))
+    n_to_replace = min(url_replace_count, n_matches) if n_matches else url_replace_count
+
+    # "same" mode only ever needs ONE URL pulled from the sheet, no matter
+    # how many occurrences it gets stamped into. "unique" mode needs one
+    # distinct URL per occurrence being replaced.
+    fetch_count = 1 if url_replace_mode == "same" else max(n_to_replace, 1)
+
+    new_urls, used_rows, url_col_idx, status_col_idx = sheet_get_next_urls(
+        sheets_service, captions_sheet_id, fetch_count
+    )
+
+    if new_urls:
+        if url_replace_mode == "unique" and len(new_urls) < n_to_replace:
+            warn(f"Only {len(new_urls)} unused URL(s) available — replacing "
+                 f"{len(new_urls)} instead of {n_to_replace}")
+            n_to_replace = len(new_urls)
+        caption = replace_urls_in_caption(caption, new_urls, url_replace_mode, n_to_replace)
     else:
-        warn(f"No URL available in the '{URLS_SHEET_NAME}' tab — "
-             f"posting caption without swapping a URL")
+        warn(f"No unused URLs available in the '{URLS_SHEET_NAME}' tab — "
+             f"posting caption without swapping any URL")
 
     try:
         videos = gdrive_list_videos(service, upload_folder)
@@ -1364,14 +1493,15 @@ def run_once():
         except Exception as e:
             warn(f"Move to uploaded folder failed: {e}")
 
-        # Only the used URL is removed — the caption itself is left in place
-        # so the same caption (with a fresh URL) is used again next run.
-        if next_url and url_row is not None:
-            sheet_clear_url(sheets_service, captions_sheet_id, url_row, url_col)
-        info("Caption left in sheet (not cleared) — will be reused next run with a new URL")
+        # Used URLs are marked "Posted" in the Status column (never deleted),
+        # so they're skipped next time. The caption itself is left in place
+        # so the same caption (with fresh URL(s)) is used again next run.
+        if new_urls and used_rows:
+            sheet_mark_urls_status(sheets_service, captions_sheet_id, used_rows, status_col_idx, "Posted")
+        info("Caption left in sheet (not cleared) — will be reused next run with new URL(s)")
     else:
         warn("Upload not confirmed — file stays in upload folder for retry, "
-             "caption and URL list left untouched")
+             "caption left untouched and no URLs marked as Posted")
 
     print(f"\n{'='*60}")
     print(f"  Run complete. Published={published}")
