@@ -3,6 +3,24 @@ post_facebook.py  — VERBOSE DEBUG VERSION
 ─────────────────────────────────────────
 Every step prints exactly what it's doing and why it failed.
 Run with:  python -u post_facebook.py --once
+
+ALL runtime settings (Drive folders, loop interval, max runtime, captions)
+are read from the Google Sheet at CAPTIONS_SHEET_ID / DEFAULT_CAPTIONS_SHEET_ID.
+Nothing except the Facebook session and Google credentials come from the
+GitHub Actions workflow anymore. See the SHEET HEADER COLUMNS section below.
+
+SHEET HEADER COLUMNS (row 1 = headers, exact names, case-insensitive):
+  Caption               — one caption per row; the oldest non-empty one is
+                           used each run, then cleared once posted.
+  UploadFolderID         — Drive folder ID holding pending videos.
+                           Read from row 2 only.
+  UploadedFolderID        — Drive folder ID videos get moved to after a
+                           successful post. Read from row 2 only.
+  LoopIntervalMinutes    — minutes between posts. Read from row 2 only.
+                           Defaults to 30 if blank/missing.
+  MaxRuntimeMinutes      — total minutes this job runs before exiting
+                           cleanly so the workflow can self-requeue.
+                           Read from row 2 only. Defaults to 300 if blank.
 """
 
 import asyncio, io, json, os, sys, tempfile, time
@@ -20,7 +38,7 @@ try:
 except ImportError:
     HAS_SCHEDULE = False
 
-# ── Google Drive ──────────────────────────────────────────────────────────────
+# ── Google Drive / Sheets ──────────────────────────────────────────────────────
 try:
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
@@ -35,16 +53,26 @@ from playwright.async_api import async_playwright
 
 # ─────────────────────────────────────────────────────────────────────────────
 STORAGE_STATE         = "storage_state.json"
-CAPTIONS_TXT          = "captions.txt"
 SCREENSHOTS_DIR       = Path("screenshots")
 
 FB_STORAGE_STATE_ENV      = "FB_STORAGE_STATE"
 GDRIVE_CREDS_ENV          = "GOOGLE_CREDENTIALS_JSON"
-UPLOAD_FOLDER_ENV         = "GDRIVE_UPLOAD_FOLDER_ID"
-UPLOADED_FOLDER_ENV       = "GDRIVE_UPLOADED_FOLDER_ID"
-CAPTIONS_FILE_ENV         = "CAPTIONS_FILE_ID"
-LOOP_INTERVAL_MINUTES     = int(os.environ.get("LOOP_INTERVAL_MINUTES", 30))
-VIDEO_EXTENSIONS          = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+CAPTIONS_SHEET_ID_ENV     = "CAPTIONS_SHEET_ID"
+# Falls back to the sheet you shared if the env var / workflow input is blank
+DEFAULT_CAPTIONS_SHEET_ID = "1ICgS97JJ-Hrs9qsI1UV-xJvPg7ovmSHStGQPoOYr0Dk"
+
+DEFAULT_LOOP_INTERVAL_MINUTES = 30
+DEFAULT_MAX_RUNTIME_MINUTES   = 300
+
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+
+# Header names expected in row 1 of the sheet (case-insensitive match)
+SETTINGS_COLUMNS = {
+    "upload_folder_id":      "UploadFolderID",
+    "uploaded_folder_id":    "UploadedFolderID",
+    "loop_interval_minutes": "LoopIntervalMinutes",
+    "max_runtime_minutes":   "MaxRuntimeMinutes",
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP LOGGER
@@ -64,11 +92,11 @@ def fail(msg):   print(f"   ❌ {msg}")
 def debug(msg):  print(f"   🔍 {msg}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Google Drive helpers
+# Google credentials / services
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_drive_service():
-    step("Building Google Drive service")
+def build_google_creds():
+    step("Building Google credentials")
     if not HAS_GDRIVE:
         fail("google-auth not installed")
         raise RuntimeError("Missing google-auth libraries")
@@ -100,7 +128,13 @@ def build_drive_service():
         token_uri     = creds_data.get("token_uri", "https://oauth2.googleapis.com/token"),
         client_id     = creds_data.get("client_id"),
         client_secret = creds_data.get("client_secret"),
-        scopes        = creds_data.get("scopes", ["https://www.googleapis.com/auth/drive"]),
+        # NOTE: your GOOGLE_CREDENTIALS_JSON's refresh token must have been
+        # issued with BOTH scopes below, or the Sheets call will fail with
+        # an insufficient-permissions error even though Drive still works.
+        scopes        = creds_data.get("scopes", [
+            "https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/spreadsheets",
+        ]),
     )
     info(f"Token expired: {creds.expired}")
     info(f"Has refresh_token: {bool(creds.refresh_token)}")
@@ -114,8 +148,20 @@ def build_drive_service():
             fail(f"Token refresh failed: {e}")
             raise
 
+    return creds
+
+
+def build_drive_service(creds):
+    step("Building Google Drive service")
     service = build("drive", "v3", credentials=creds, cache_discovery=False)
     ok("Google Drive service built")
+    return service
+
+
+def build_sheets_service(creds):
+    step("Building Google Sheets service")
+    service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    ok("Google Sheets service built")
     return service
 
 
@@ -182,20 +228,132 @@ def gdrive_move_to_uploaded(service, file_id, file_name, src_folder_id, dst_fold
         raise
 
 
-def gdrive_get_caption(service) -> str | None:
-    step("Fetching caption from Google Drive")
-    file_id = os.environ.get(CAPTIONS_FILE_ENV)
-    if not file_id:
-        info("CAPTIONS_FILE_ID not set — skipping Drive caption fetch")
-        return None
+# ─────────────────────────────────────────────────────────────────────────────
+# Google Sheet settings & caption helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _read_sheet_rows(sheets_service, spreadsheet_id):
     try:
-        content = service.files().get_media(fileId=file_id).execute()
-        text = content.decode("utf-8").strip() if isinstance(content, bytes) else content.strip()
-        ok(f"Caption fetched ({len(text)} chars): {text[:80]}")
-        return text
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range="A:Z"
+        ).execute()
     except Exception as e:
-        warn(f"Could not fetch captions: {e}")
-        return None
+        fail(f"Sheets API read failed: {e}")
+        return []
+    return result.get("values", [])
+
+
+def sheet_get_settings(sheets_service, spreadsheet_id: str) -> dict:
+    """
+    Reads UploadFolderID / UploadedFolderID / LoopIntervalMinutes /
+    MaxRuntimeMinutes from row 2 of the sheet (matched by header name in
+    row 1). Returns a dict with whichever keys were found — missing or
+    blank values are simply absent, callers apply their own defaults.
+    """
+    step(f"Fetching settings from Google Sheet: {spreadsheet_id}")
+    rows = _read_sheet_rows(sheets_service, spreadsheet_id)
+    if len(rows) < 2:
+        warn("Sheet has no data row (row 2) — cannot read settings")
+        return {}
+
+    header = rows[0]
+    data_row = rows[1]
+    info(f"Header row: {header}")
+
+    col_index = {h.strip().lower(): i for i, h in enumerate(header) if h.strip()}
+
+    settings = {}
+    for key, col_name in SETTINGS_COLUMNS.items():
+        idx = col_index.get(col_name.lower())
+        if idx is None:
+            warn(f"Column '{col_name}' not found in header row")
+            continue
+        if idx < len(data_row) and data_row[idx].strip():
+            settings[key] = data_row[idx].strip()
+            info(f"  {col_name} = {settings[key]}")
+        else:
+            warn(f"  {col_name} is empty in row 2")
+
+    return settings
+
+
+def sheet_get_caption(sheets_service, spreadsheet_id: str):
+    """
+    Finds the 'Caption' column and returns the first non-empty caption
+    found below the header, along with its row/column index so it can be
+    cleared once the post is published.
+    Returns (caption, row_num, col_idx) or (None, None, None).
+    """
+    step(f"Fetching caption from Google Sheet: {spreadsheet_id}")
+    rows = _read_sheet_rows(sheets_service, spreadsheet_id)
+    if not rows:
+        warn("Sheet appears empty")
+        return None, None, None
+
+    header = rows[0]
+    info(f"Header row: {header}")
+
+    col_idx = None
+    for i, h in enumerate(header):
+        if h.strip().lower() == "caption":
+            col_idx = i
+            break
+
+    if col_idx is None:
+        fail("No 'Caption' column found in header row — check your sheet headers")
+        return None, None, None
+
+    info(f"'Caption' column found at index {col_idx} (column {chr(ord('A') + col_idx)})")
+
+    for row_num, row in enumerate(rows[1:], start=2):
+        if len(row) > col_idx and row[col_idx].strip():
+            caption = row[col_idx].strip()
+            ok(f"Caption found at row {row_num}: {caption[:80]}")
+            return caption, row_num, col_idx
+
+    warn("No unused caption found in sheet (all rows empty)")
+    return None, None, None
+
+
+def sheet_clear_caption(sheets_service, spreadsheet_id: str, row_num: int, col_idx: int):
+    """Clears the caption cell after it's been used, so the next run picks the next one."""
+    step(f"Clearing used caption at row {row_num}")
+    try:
+        col_letter = chr(ord('A') + col_idx)
+        cell_range = f"{col_letter}{row_num}"
+        sheets_service.spreadsheets().values().clear(
+            spreadsheetId=spreadsheet_id, range=cell_range, body={}
+        ).execute()
+        ok(f"Caption cell {cell_range} cleared")
+    except Exception as e:
+        warn(f"Could not clear caption cell: {e}")
+
+
+def _to_int(val, default):
+    try:
+        return int(str(val).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def fetch_loop_timing():
+    """
+    Builds its own creds/Sheets service and reads LoopIntervalMinutes /
+    MaxRuntimeMinutes from the sheet, with sane defaults if anything is
+    missing. Used once at scheduler startup.
+    """
+    settings = {}
+    try:
+        creds = build_google_creds()
+        sheets_service = build_sheets_service(creds)
+        captions_sheet_id = os.environ.get(CAPTIONS_SHEET_ID_ENV) or DEFAULT_CAPTIONS_SHEET_ID
+        settings = sheet_get_settings(sheets_service, captions_sheet_id)
+    except Exception as e:
+        warn(f"Could not read loop timing from sheet, using defaults: {e}")
+
+    loop_interval = _to_int(settings.get("loop_interval_minutes"), DEFAULT_LOOP_INTERVAL_MINUTES)
+    max_runtime   = _to_int(settings.get("max_runtime_minutes"), DEFAULT_MAX_RUNTIME_MINUTES)
+    return loop_interval, max_runtime
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1037,38 +1195,37 @@ def run_once():
     print(f"{'='*60}")
 
     step("Checking environment variables")
-    for var in [UPLOAD_FOLDER_ENV, UPLOADED_FOLDER_ENV, "LOOP_INTERVAL_MINUTES", "CAPTIONS_FILE_ID"]:
-        val = os.environ.get(var, "")
-        info(f"{var}: {'SET (' + val + ')' if val else 'NOT SET'}")
+    info(f"{CAPTIONS_SHEET_ID_ENV}: {os.environ.get(CAPTIONS_SHEET_ID_ENV) or '(using default sheet)'}")
     for secret in [FB_STORAGE_STATE_ENV, GDRIVE_CREDS_ENV]:
         val = os.environ.get(secret, "")
         info(f"{secret}: {'SET (' + str(len(val)) + ' chars)' if val else 'NOT SET'}")
 
-    upload_folder   = os.environ.get(UPLOAD_FOLDER_ENV)
-    uploaded_folder = os.environ.get(UPLOADED_FOLDER_ENV)
+    try:
+        creds          = build_google_creds()
+        service        = build_drive_service(creds)
+        sheets_service = build_sheets_service(creds)
+    except Exception as e:
+        fail(f"Google service setup failed: {e}")
+        return
+
+    captions_sheet_id = os.environ.get(CAPTIONS_SHEET_ID_ENV) or DEFAULT_CAPTIONS_SHEET_ID
+
+    settings = sheet_get_settings(sheets_service, captions_sheet_id)
+    upload_folder   = settings.get("upload_folder_id")
+    uploaded_folder = settings.get("uploaded_folder_id")
 
     if not upload_folder:
-        fail(f"{UPLOAD_FOLDER_ENV} is not set — cannot continue")
+        fail("UploadFolderID is missing/empty in the sheet (row 2) — cannot continue")
         return
     if not uploaded_folder:
-        fail(f"{UPLOADED_FOLDER_ENV} is not set — cannot continue")
+        fail("UploadedFolderID is missing/empty in the sheet (row 2) — cannot continue")
         return
 
-    try:
-        service = build_drive_service()
-    except Exception as e:
-        fail(f"Drive service failed: {e}")
-        return
-
-    caption = gdrive_get_caption(service)
+    caption, cap_row, cap_col = sheet_get_caption(sheets_service, captions_sheet_id)
     if not caption:
-        cap_path = Path(CAPTIONS_TXT)
-        if cap_path.exists():
-            caption = cap_path.read_text(encoding="utf-8").strip()
-            info(f"Using local captions.txt: {caption[:80]}")
-        else:
-            caption = "Check out my latest reel! #reels #viral"
-            info(f"Using default caption: {caption}")
+        fail("No caption available in the Google Sheet — aborting this run "
+             "(add a value to the 'Caption' column)")
+        return
 
     try:
         videos = gdrive_list_videos(service, upload_folder)
@@ -1105,8 +1262,10 @@ def run_once():
             gdrive_move_to_uploaded(service, file_id, file_name, upload_folder, uploaded_folder)
         except Exception as e:
             warn(f"Move to uploaded folder failed: {e}")
+        if cap_row is not None:
+            sheet_clear_caption(sheets_service, captions_sheet_id, cap_row, cap_col)
     else:
-        warn("Upload not confirmed — file stays in upload folder for retry")
+        warn("Upload not confirmed — file stays in upload folder for retry, caption left untouched")
 
     print(f"\n{'='*60}")
     print(f"  Run complete. Published={published}")
@@ -1119,11 +1278,23 @@ def run_scheduled():
     if not HAS_SCHEDULE:
         fail("'schedule' package not installed. Run: pip install schedule")
         sys.exit(1)
-    print(f"⏰ Scheduler started — posting every {LOOP_INTERVAL_MINUTES} minute(s)")
+
+    loop_interval_minutes, max_runtime_minutes = fetch_loop_timing()
+    print(f"⏰ Scheduler started — posting every {loop_interval_minutes} minute(s); "
+          f"this window closes after {max_runtime_minutes} minute(s) "
+          f"(both read from the Google Sheet)")
+
     run_once()
-    schedule.every(LOOP_INTERVAL_MINUTES).minutes.do(run_once)
+    schedule.every(loop_interval_minutes).minutes.do(run_once)
+
+    start_time = time.monotonic()
     iteration = 0
     while True:
+        elapsed_minutes = (time.monotonic() - start_time) / 60
+        if elapsed_minutes >= max_runtime_minutes:
+            print(f"⏹️  Runtime window of {max_runtime_minutes} minute(s) reached — "
+                  f"exiting cleanly so the workflow can self-requeue")
+            return
         schedule.run_pending()
         time.sleep(30)
         iteration += 1
