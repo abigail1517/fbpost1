@@ -10,8 +10,11 @@ Nothing except the Facebook session and Google credentials come from the
 GitHub Actions workflow anymore. See the SHEET HEADER COLUMNS section below.
 
 SHEET HEADER COLUMNS (row 1 = headers, exact names, case-insensitive):
-  Caption               — one caption per row; the oldest non-empty one is
-                           used each run, then cleared once posted.
+  Caption               — the caption to post. It is NEVER cleared — the
+                           same caption row (row 2, first non-empty row)
+                           is reused every run. Each run, one URL from the
+                           'Urls' tab is swapped into the caption before
+                           posting (see below).
   UploadFolderID         — Drive folder ID holding pending videos.
                            Read from row 2 only.
   UploadedFolderID        — Drive folder ID videos get moved to after a
@@ -21,9 +24,17 @@ SHEET HEADER COLUMNS (row 1 = headers, exact names, case-insensitive):
   MaxRuntimeMinutes      — total minutes this job runs before exiting
                            cleanly so the workflow can self-requeue.
                            Read from row 2 only. Defaults to 300 if blank.
+
+'Urls' TAB (same spreadsheet, separate tab named exactly "Urls"):
+  Urls                   — one URL per row. Each run, the first non-empty
+                           URL is taken, swapped into the caption (replacing
+                           whatever URL already appears in the caption, or
+                           appended if the caption has none), and that cell
+                           is then cleared so it isn't reused on the next run.
+                           The Caption cell itself is left untouched.
 """
 
-import asyncio, io, json, os, sys, tempfile, time
+import asyncio, io, json, os, re, sys, tempfile, time
 from pathlib import Path
 from datetime import datetime
 import functools
@@ -73,6 +84,11 @@ SETTINGS_COLUMNS = {
     "loop_interval_minutes": "LoopIntervalMinutes",
     "max_runtime_minutes":   "MaxRuntimeMinutes",
 }
+
+# 'Urls' tab config
+URLS_SHEET_NAME  = "Urls"
+URLS_COLUMN_NAME = "Urls"
+URL_REGEX        = re.compile(r'https?://\S+')
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP LOGGER
@@ -229,16 +245,16 @@ def gdrive_move_to_uploaded(service, file_id, file_name, src_folder_id, dst_fold
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Google Sheet settings & caption helpers
+# Google Sheet settings, caption & URL helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _read_sheet_rows(sheets_service, spreadsheet_id):
+def _read_sheet_rows(sheets_service, spreadsheet_id, range_str="A:Z"):
     try:
         result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id, range="A:Z"
+            spreadsheetId=spreadsheet_id, range=range_str
         ).execute()
     except Exception as e:
-        fail(f"Sheets API read failed: {e}")
+        fail(f"Sheets API read failed ({range_str}): {e}")
         return []
     return result.get("values", [])
 
@@ -280,8 +296,11 @@ def sheet_get_settings(sheets_service, spreadsheet_id: str) -> dict:
 def sheet_get_caption(sheets_service, spreadsheet_id: str):
     """
     Finds the 'Caption' column and returns the first non-empty caption
-    found below the header, along with its row/column index so it can be
-    cleared once the post is published.
+    found below the header, along with its row/column index.
+
+    NOTE: the caption is intentionally NEVER cleared by this script
+    anymore — the same caption is reused on every run. Only the URL
+    inside it changes (see sheet_get_next_url / replace_url_in_caption).
     Returns (caption, row_num, col_idx) or (None, None, None).
     """
     step(f"Fetching caption from Google Sheet: {spreadsheet_id}")
@@ -311,12 +330,85 @@ def sheet_get_caption(sheets_service, spreadsheet_id: str):
             ok(f"Caption found at row {row_num}: {caption[:80]}")
             return caption, row_num, col_idx
 
-    warn("No unused caption found in sheet (all rows empty)")
+    warn("No caption found in sheet (all rows empty)")
     return None, None, None
 
 
+def sheet_get_next_url(sheets_service, spreadsheet_id: str):
+    """
+    Reads the 'Urls' tab (same spreadsheet) and returns the first
+    non-empty URL found in the 'Urls' column, along with its row/column
+    index so it can be removed after use.
+    Returns (url, row_num, col_idx) or (None, None, None).
+    """
+    step(f"Fetching next URL from '{URLS_SHEET_NAME}' tab")
+    range_str = f"'{URLS_SHEET_NAME}'!A:Z"
+    rows = _read_sheet_rows(sheets_service, spreadsheet_id, range_str)
+    if not rows:
+        warn(f"'{URLS_SHEET_NAME}' tab appears empty or missing")
+        return None, None, None
+
+    header = rows[0]
+    info(f"Header row ({URLS_SHEET_NAME}): {header}")
+
+    col_idx = None
+    for i, h in enumerate(header):
+        if h.strip().lower() == URLS_COLUMN_NAME.lower():
+            col_idx = i
+            break
+
+    if col_idx is None:
+        fail(f"No '{URLS_COLUMN_NAME}' column found in '{URLS_SHEET_NAME}' tab header row")
+        return None, None, None
+
+    info(f"'{URLS_COLUMN_NAME}' column found at index {col_idx} "
+         f"(column {chr(ord('A') + col_idx)})")
+
+    for row_num, row in enumerate(rows[1:], start=2):
+        if len(row) > col_idx and row[col_idx].strip():
+            url = row[col_idx].strip()
+            ok(f"URL found at row {row_num}: {url}")
+            return url, row_num, col_idx
+
+    warn(f"No unused URL found in '{URLS_SHEET_NAME}' tab (all rows empty)")
+    return None, None, None
+
+
+def sheet_clear_url(sheets_service, spreadsheet_id: str, row_num: int, col_idx: int):
+    """Clears the used URL cell in the 'Urls' tab so it isn't reused next run."""
+    step(f"Removing used URL at '{URLS_SHEET_NAME}' row {row_num}")
+    try:
+        col_letter = chr(ord('A') + col_idx)
+        cell_range = f"'{URLS_SHEET_NAME}'!{col_letter}{row_num}"
+        sheets_service.spreadsheets().values().clear(
+            spreadsheetId=spreadsheet_id, range=cell_range, body={}
+        ).execute()
+        ok(f"URL cell {cell_range} cleared")
+    except Exception as e:
+        warn(f"Could not clear URL cell: {e}")
+
+
+def replace_url_in_caption(caption: str, new_url: str) -> str:
+    """
+    Finds the first URL already inside the caption and swaps it for
+    new_url. If the caption has no URL in it, new_url is appended on its
+    own line instead so it still ends up in the post.
+    """
+    if URL_REGEX.search(caption):
+        updated = URL_REGEX.sub(new_url, caption, count=1)
+        ok("Replaced existing URL inside caption with new URL")
+        return updated
+    else:
+        warn("Caption had no URL to replace — appending new URL instead")
+        return f"{caption}\n{new_url}"
+
+
 def sheet_clear_caption(sheets_service, spreadsheet_id: str, row_num: int, col_idx: int):
-    """Clears the caption cell after it's been used, so the next run picks the next one."""
+    """
+    (Kept for reference / manual use — no longer called automatically.)
+    Clears the caption cell. The main loop intentionally does NOT call
+    this anymore, since the caption is meant to be reused every run.
+    """
     step(f"Clearing used caption at row {row_num}")
     try:
         col_letter = chr(ord('A') + col_idx)
@@ -1221,11 +1313,20 @@ def run_once():
         fail("UploadedFolderID is missing/empty in the sheet (row 2) — cannot continue")
         return
 
+    # Caption is reused every run — it is never cleared.
     caption, cap_row, cap_col = sheet_get_caption(sheets_service, captions_sheet_id)
     if not caption:
         fail("No caption available in the Google Sheet — aborting this run "
              "(add a value to the 'Caption' column)")
         return
+
+    # Pull the next unused URL from the 'Urls' tab and swap it into the caption.
+    next_url, url_row, url_col = sheet_get_next_url(sheets_service, captions_sheet_id)
+    if next_url:
+        caption = replace_url_in_caption(caption, next_url)
+    else:
+        warn(f"No URL available in the '{URLS_SHEET_NAME}' tab — "
+             f"posting caption without swapping a URL")
 
     try:
         videos = gdrive_list_videos(service, upload_folder)
@@ -1262,10 +1363,15 @@ def run_once():
             gdrive_move_to_uploaded(service, file_id, file_name, upload_folder, uploaded_folder)
         except Exception as e:
             warn(f"Move to uploaded folder failed: {e}")
-        if cap_row is not None:
-            sheet_clear_caption(sheets_service, captions_sheet_id, cap_row, cap_col)
+
+        # Only the used URL is removed — the caption itself is left in place
+        # so the same caption (with a fresh URL) is used again next run.
+        if next_url and url_row is not None:
+            sheet_clear_url(sheets_service, captions_sheet_id, url_row, url_col)
+        info("Caption left in sheet (not cleared) — will be reused next run with a new URL")
     else:
-        warn("Upload not confirmed — file stays in upload folder for retry, caption left untouched")
+        warn("Upload not confirmed — file stays in upload folder for retry, "
+             "caption and URL list left untouched")
 
     print(f"\n{'='*60}")
     print(f"  Run complete. Published={published}")
