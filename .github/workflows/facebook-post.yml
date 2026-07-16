@@ -11,9 +11,10 @@ on:
         description: "Google Drive folder ID to move videos to after a successful upload"
         required: true
         type: string
-      captions_file_id:
-        description: "(Optional) Google Drive file ID of captions.txt"
+      captions_sheet_id:
+        description: "Google Sheet ID with a 'Caption' column (defaults to the shared sheet if left blank)"
         required: false
+        default: "1ICgS97JJ-Hrs9qsI1UV-xJvPg7ovmSHStGQPoOYr0Dk"
         type: string
       loop_interval_minutes:
         description: "Minutes between posts (default: 30)"
@@ -50,8 +51,6 @@ jobs:
       # ── 3. Dependencies ──────────────────────────────────────────────────
       - name: Install dependencies
         run: |
-          SECONDS=$(( ${{ inputs.max_runtime_minutes }} * 60 ))
-          timeout ${SECONDS} python -u post_facebook.py || true
           pip install playwright schedule \
                       google-auth google-auth-httplib2 google-api-python-client
           playwright install chromium --with-deps
@@ -77,6 +76,7 @@ jobs:
               echo "❌ $VAR_NAME is MISSING"
             fi
           done
+          echo "📝 Captions sheet : ${{ inputs.captions_sheet_id }}"
           echo "⏱️  Loop interval : ${{ inputs.loop_interval_minutes }} minute(s)"
           echo "⏱️  Max runtime   : ${{ inputs.max_runtime_minutes }} minute(s)"
 
@@ -94,7 +94,7 @@ jobs:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           GDRIVE_UPLOAD_FOLDER_ID: ${{ inputs.gdrive_upload_folder_id }}
           GDRIVE_UPLOADED_FOLDER_ID: ${{ inputs.gdrive_uploaded_folder_id }}
-          CAPTIONS_FILE_ID:        ${{ inputs.captions_file_id }}
+          CAPTIONS_SHEET_ID:       ${{ inputs.captions_sheet_id }}
           LOOP_INTERVAL_MINUTES:   ${{ inputs.loop_interval_minutes }}
         # `timeout` exits with code 124 when time expires — that is expected,
         # so we append `|| true` to prevent the step from failing the job.
@@ -160,7 +160,7 @@ jobs:
             --ref "${{ github.ref_name }}" \
             --field gdrive_upload_folder_id="${{ inputs.gdrive_upload_folder_id }}" \
             --field gdrive_uploaded_folder_id="${{ inputs.gdrive_uploaded_folder_id }}" \
-            --field captions_file_id="${{ inputs.captions_file_id }}" \
+            --field captions_sheet_id="${{ inputs.captions_sheet_id }}" \
             --field loop_interval_minutes="${{ inputs.loop_interval_minutes }}" \
             --field max_runtime_minutes="${{ inputs.max_runtime_minutes }}"
 
