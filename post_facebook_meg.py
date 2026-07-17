@@ -73,6 +73,26 @@ SHEET HEADER COLUMNS (row 1 = headers, exact names, case-insensitive):
                            deleted). Add this header yourself if it isn't
                            already there.
 
+  FbStorageState         — (on the main tab, row 2, alongside Caption
+                           etc.) holds the Facebook session (Playwright
+                           storage_state JSON) as plain text. This is now
+                           the PRIMARY source for the session — no more
+                           relying on a GitHub secret that has to be
+                           refreshed via the GitHub CLI. On every run,
+                           after the browser closes, the script deletes
+                           whatever was in this cell and writes the fresh
+                           session back into it, so the sheet always holds
+                           the newest cookies and the login never goes
+                           stale between runs. FB_STORAGE_STATE (the old
+                           GitHub secret) is now only used as a one-time
+                           seed: if the sheet cell is empty (e.g. the very
+                           first run), the script falls back to it, then
+                           to a local storage_state.json file. Add this
+                           header yourself if it isn't already there —
+                           just paste your current session JSON into row 2
+                           once, and the script takes over refreshing it
+                           from there.
+
 ─────────────────────────────────────────
 CHANGELOG (this version)
 ─────────────────────────────────────────
@@ -167,6 +187,11 @@ URLS_COLUMN_NAME        = "Urls"
 URLS_STATUS_COLUMN_NAME = "Status"
 URLS_POSTED_VALUES      = {"posted", "replaced"}  # values treated as "already used"
 URL_REGEX                = re.compile(r'https?://\S+')
+
+# Main-tab column that stores the Facebook session (Playwright storage_state
+# JSON) so it can be refreshed every run without a GitHub secret.
+FB_STORAGE_STATE_COLUMN_NAME = "FbStorageState"
+SHEETS_CELL_CHAR_LIMIT       = 50000  # Google Sheets per-cell text limit
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP LOGGER
@@ -452,6 +477,77 @@ def sheet_get_withoutlink_caption(sheets_service, spreadsheet_id: str):
     return _sheet_get_named_column(sheets_service, spreadsheet_id, "WithoutLinkCap", required=False)
 
 
+def _sheet_find_column_index(sheets_service, spreadsheet_id: str, column_name: str):
+    """Returns the 0-based index of `column_name` in row 1, or None if not found."""
+    rows = _read_sheet_rows(sheets_service, spreadsheet_id)
+    if not rows:
+        return None
+    header = rows[0]
+    for i, h in enumerate(header):
+        if h.strip().lower() == column_name.lower():
+            return i
+    return None
+
+
+def sheet_get_fb_storage_state(sheets_service, spreadsheet_id: str):
+    """
+    Reads the current Facebook session (storage_state JSON) from the
+    'FbStorageState' column, row 2. This is the primary source for the
+    session now — refreshed by sheet_set_fb_storage_state() after every
+    run so it never goes stale. Optional column: if missing/empty,
+    callers should fall back to the FB_STORAGE_STATE env var / local file.
+    Returns (json_str, row_num, col_idx) or (None, None, None).
+    """
+    return _sheet_get_named_column(
+        sheets_service, spreadsheet_id, FB_STORAGE_STATE_COLUMN_NAME, required=False
+    )
+
+
+def sheet_set_fb_storage_state(sheets_service, spreadsheet_id: str, storage_state_json: str):
+    """
+    Refreshes the Facebook session stored in the 'FbStorageState' column
+    (row 2): the OLD value is deleted first, then the fresh session JSON
+    is written in its place, so the sheet always holds exactly one
+    up-to-date session and the login never expires between runs. If the
+    'FbStorageState' header doesn't exist yet, this just warns and does
+    nothing (add the header once to enable sheet-based session storage).
+    """
+    step(f"Refreshing '{FB_STORAGE_STATE_COLUMN_NAME}' in Google Sheet")
+
+    if len(storage_state_json) > SHEETS_CELL_CHAR_LIMIT:
+        warn(f"Session JSON is {len(storage_state_json)} chars, over the "
+             f"{SHEETS_CELL_CHAR_LIMIT}-char Google Sheets cell limit — "
+             f"cannot store it in the sheet this run")
+        return
+
+    col_idx = _sheet_find_column_index(sheets_service, spreadsheet_id, FB_STORAGE_STATE_COLUMN_NAME)
+    if col_idx is None:
+        warn(f"No '{FB_STORAGE_STATE_COLUMN_NAME}' column found in header row — "
+             f"add this header (row 2 will hold the session JSON) to enable "
+             f"sheet-based session refresh. Skipping for now.")
+        return
+
+    col_letter = chr(ord('A') + col_idx)
+    cell_range = f"{col_letter}2"
+
+    try:
+        # Delete the old session first...
+        sheets_service.spreadsheets().values().clear(
+            spreadsheetId=spreadsheet_id, range=cell_range, body={}
+        ).execute()
+        # ...then write the fresh one in its place.
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=cell_range,
+            valueInputOption="RAW",
+            body={"values": [[storage_state_json]]},
+        ).execute()
+        ok(f"'{FB_STORAGE_STATE_COLUMN_NAME}' cell {cell_range} refreshed "
+           f"with the latest session ({len(storage_state_json)} chars)")
+    except Exception as e:
+        warn(f"Could not refresh '{FB_STORAGE_STATE_COLUMN_NAME}' in sheet: {e}")
+
+
 def sheet_get_next_urls(sheets_service, spreadsheet_id: str, count: int):
     """
     Reads the 'Urls' tab (same spreadsheet) and returns up to `count`
@@ -666,8 +762,31 @@ def fetch_loop_timing():
 # Facebook / Playwright helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def resolve_fb_storage_state() -> str | None:
+def resolve_fb_storage_state(sheets_service=None, spreadsheet_id=None) -> str | None:
     step("Resolving Facebook storage state")
+
+    # 1) PRIMARY: the 'FbStorageState' cell in the Google Sheet — this is
+    #    kept fresh every run by sheet_set_fb_storage_state(), so it's the
+    #    most reliable source and avoids GitHub-secret refresh entirely.
+    if sheets_service is not None and spreadsheet_id:
+        sheet_val, _row, _col = sheet_get_fb_storage_state(sheets_service, spreadsheet_id)
+        if sheet_val:
+            info(f"'{FB_STORAGE_STATE_COLUMN_NAME}' found in sheet, length={len(sheet_val)}")
+            try:
+                parsed = json.loads(sheet_val)
+                cookies = parsed.get("cookies", [])
+                ok(f"Valid JSON from sheet — {len(cookies)} cookies found")
+                for c in cookies:
+                    info(f"  Cookie: name={c.get('name')} expires={c.get('expires')} domain={c.get('domain')}")
+                return sheet_val
+            except json.JSONDecodeError as e:
+                fail(f"'{FB_STORAGE_STATE_COLUMN_NAME}' in sheet is not valid JSON: {e}")
+        else:
+            warn(f"'{FB_STORAGE_STATE_COLUMN_NAME}' column empty/missing in sheet — "
+                 f"falling back to FB_STORAGE_STATE env var / local file")
+
+    # 2) FALLBACK: FB_STORAGE_STATE env var (secret) — useful as a one-time
+    #    seed before the sheet has ever been populated.
     env_val = os.environ.get(FB_STORAGE_STATE_ENV)
     if env_val:
         info(f"FB_STORAGE_STATE env var found, length={len(env_val)}")
@@ -683,6 +802,7 @@ def resolve_fb_storage_state() -> str | None:
     else:
         warn("FB_STORAGE_STATE env var not set")
 
+    # 3) LAST RESORT: a local storage_state.json left over from a previous run.
     if Path(STORAGE_STATE).exists():
         info(f"Found local {STORAGE_STATE} — using it")
         return Path(STORAGE_STATE).read_text(encoding="utf-8")
@@ -1054,7 +1174,7 @@ async def enter_caption_lexical(page, caption: str) -> bool:
 # Upload flow
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def upload_reel(caption: str, video_path: str) -> bool:
+async def upload_reel(caption: str, video_path: str, sheets_service=None, spreadsheet_id=None) -> bool:
     step("Starting Facebook Reel upload")
     if not Path(video_path).exists():
         fail(f"Video file not found: {video_path}")
@@ -1082,7 +1202,7 @@ async def upload_reel(caption: str, video_path: str) -> bool:
             fail(f"Browser launch FAILED: {e}")
             return False
 
-        storage_state_json = resolve_fb_storage_state()
+        storage_state_json = resolve_fb_storage_state(sheets_service, spreadsheet_id)
         if not storage_state_json:
             fail("No Facebook session available — aborting")
             await browser.close()
@@ -1133,8 +1253,19 @@ async def upload_reel(caption: str, video_path: str) -> bool:
         finally:
             try:
                 fresh = await context.storage_state()
-                Path(STORAGE_STATE).write_text(json.dumps(fresh), encoding="utf-8")
-                ok(f"Saved refreshed storage_state ({len(fresh.get('cookies', []))} cookies)")
+                fresh_json = json.dumps(fresh)
+                Path(STORAGE_STATE).write_text(fresh_json, encoding="utf-8")
+                ok(f"Saved refreshed storage_state locally ({len(fresh.get('cookies', []))} cookies)")
+
+                # Persist the refreshed session back to the Google Sheet so
+                # the next run (even a fresh GitHub Actions job with no
+                # local files) picks up the newest cookies instead of an
+                # expiring GitHub secret.
+                if sheets_service is not None and spreadsheet_id:
+                    sheet_set_fb_storage_state(sheets_service, spreadsheet_id, fresh_json)
+                else:
+                    warn("No Sheets service/spreadsheet ID available — "
+                         "could not refresh the session in the Google Sheet")
             except Exception as e:
                 warn(f"Could not save storage_state: {e}")
             await browser.close()
@@ -1674,7 +1805,12 @@ def run_once():
             return
 
         try:
-            published = asyncio.run(upload_reel(caption=caption, video_path=local_path))
+            published = asyncio.run(upload_reel(
+                caption=caption,
+                video_path=local_path,
+                sheets_service=sheets_service,
+                spreadsheet_id=captions_sheet_id,
+            ))
         except Exception as e:
             fail(f"Upload exception: {e}")
             import traceback
