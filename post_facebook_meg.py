@@ -210,6 +210,86 @@ def fail(msg):   print(f"   ❌ {msg}")
 def debug(msg):  print(f"   🔍 {msg}")
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Human-like timing / interaction helpers
+# ─────────────────────────────────────────────────────────────────────────────
+# Real people don't pause for exactly N seconds, move the mouse straight to
+# a target in a dead-straight line, or type at a perfectly constant rate.
+# These helpers add randomized jitter to waits, mouse movement, and typing
+# so the automation's timing/motion signature doesn't look scripted. They
+# are cosmetic-only — if anything here throws, we swallow it and fall back
+# to the raw action rather than ever blocking the real interaction on it.
+
+async def human_pause(min_s: float, max_s: float):
+    """Sleep for a random duration in [min_s, max_s] seconds."""
+    await asyncio.sleep(random.uniform(min_s, max_s))
+
+
+async def human_move_before_click(page, locator):
+    """
+    Nudges the mouse toward the target element in 1-3 small randomized
+    steps before clicking, instead of jumping the cursor straight there.
+    """
+    try:
+        box = await locator.bounding_box()
+        if not box:
+            return
+        target_x = box["x"] + box["width"] * random.uniform(0.35, 0.65)
+        target_y = box["y"] + box["height"] * random.uniform(0.35, 0.65)
+        steps = random.randint(1, 3)
+        for _ in range(steps):
+            jitter_x = target_x + random.uniform(-18, 18)
+            jitter_y = target_y + random.uniform(-12, 12)
+            await page.mouse.move(jitter_x, jitter_y, steps=random.randint(3, 9))
+            await human_pause(0.03, 0.13)
+        await page.mouse.move(target_x, target_y, steps=random.randint(3, 7))
+        await human_pause(0.05, 0.22)
+    except Exception:
+        pass
+
+
+async def human_click(page, locator, **kwargs):
+    """Moves the mouse naturally toward the element, pauses, then clicks."""
+    await human_move_before_click(page, locator)
+    await human_pause(0.05, 0.28)
+    await locator.click(**kwargs)
+
+
+async def human_type(page, text: str,
+                      min_char_delay: float = 0.035, max_char_delay: float = 0.16,
+                      pause_chance: float = 0.035, pause_min: float = 0.25, pause_max: float = 1.1,
+                      word_pause_chance: float = 0.12, word_pause_min: float = 0.08,
+                      word_pause_max: float = 0.3):
+    """
+    Types `text` one character at a time with a randomized per-character
+    delay, an occasional longer 'thinking' pause, and a slightly higher
+    chance of a brief pause right after a space (word boundary) — closer
+    to how a person actually types than one call with a constant delay.
+    """
+    for ch in text:
+        await page.keyboard.type(ch, delay=0)
+        await asyncio.sleep(random.uniform(min_char_delay, max_char_delay))
+        if ch == " " and random.random() < word_pause_chance:
+            await asyncio.sleep(random.uniform(word_pause_min, word_pause_max))
+        elif random.random() < pause_chance:
+            await asyncio.sleep(random.uniform(pause_min, pause_max))
+
+
+def jitter(base_seconds: float, spread: float = 0.35) -> float:
+    """
+    Returns a randomized value around `base_seconds`, +/- `spread` fraction
+    (e.g. jitter(8, 0.35) → somewhere around 5.2s-10.8s). Used to replace
+    fixed asyncio.sleep(N) waits with a value that varies run to run.
+    """
+    low = base_seconds * (1 - spread)
+    high = base_seconds * (1 + spread)
+    return random.uniform(max(low, 0.1), high)
+
+
+async def human_wait(base_seconds: float, spread: float = 0.35):
+    """asyncio.sleep(jitter(base_seconds, spread)) in one call."""
+    await asyncio.sleep(jitter(base_seconds, spread))
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Google credentials / Sheets service (Sheets only — no Drive)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -899,7 +979,7 @@ async def nuke_continue_button(page, label: str) -> bool:
                 pass
         if found_sel:
             break
-        await asyncio.sleep(1)
+        await human_wait(1, 0.4)
 
     if not found_sel:
         warn("No Continue button found in DOM after 10s")
@@ -918,7 +998,7 @@ async def nuke_continue_button(page, label: str) -> bool:
             }""")
             if hit:
                 ok(f"JS found & clicked Continue: {hit[:80]}")
-                await asyncio.sleep(5)
+                await human_wait(5, 0.3)
                 return page.url != url_before
         except Exception as e:
             warn(f"JS search failed: {e}")
@@ -927,7 +1007,7 @@ async def nuke_continue_button(page, label: str) -> bool:
         try:
             await page.goto("https://www.facebook.com/?sk=h_chr",
                             wait_until="domcontentloaded", timeout=30_000)
-            await asyncio.sleep(5)
+            await human_wait(5, 0.3)
             if not is_picker_url(page.url) and not is_hard_login_url(page.url):
                 ok(f"Direct nav bypassed picker → {page.url}")
                 return True
@@ -944,7 +1024,7 @@ async def nuke_continue_button(page, label: str) -> bool:
     ]:
         try:
             await method()
-            await asyncio.sleep(5)
+            await human_wait(5, 0.3)
             if page.url != url_before:
                 ok(f"Continue clicked via {method_name} — URL changed")
                 return True
@@ -981,7 +1061,7 @@ async def ensure_logged_in(page) -> bool:
             await save_screenshot(page, f"after_continue_{attempt+1}")
             if not ok_click:
                 warn(f"Could not click Continue on attempt {attempt+1}")
-                await asyncio.sleep(3)
+                await human_wait(3, 0.4)
             continue
 
         for sel in FEED_SELECTORS:
@@ -999,8 +1079,8 @@ async def ensure_logged_in(page) -> bool:
         except Exception:
             pass
 
-        info(f"Feed not ready yet — waiting 4s (attempt {attempt+1}/6)")
-        await asyncio.sleep(4)
+        info(f"Feed not ready yet — waiting ~4s (attempt {attempt+1}/6)")
+        await human_wait(4, 0.35)
 
     fail("Login check exhausted all 6 attempts")
     await dump_html(page, "login_failed_final.html")
@@ -1025,25 +1105,25 @@ async def enter_caption_lexical(page, caption: str) -> bool:
     ]
 
     async def strategy_clipboard(field):
-        info("Strategy 1: clipboard paste via Ctrl+V")
-        await field.click(timeout=5_000)
-        await asyncio.sleep(0.4)
+        info("Strategy 1: clipboard paste via Ctrl+V (human-paced)")
+        await human_click(page, field, timeout=5_000)
+        await human_pause(0.25, 0.7)
         await page.keyboard.press("Control+a")
-        await asyncio.sleep(0.2)
+        await human_pause(0.1, 0.35)
         await page.keyboard.press("Backspace")
-        await asyncio.sleep(0.2)
+        await human_pause(0.15, 0.5)
         await page.evaluate(
             "(text) => navigator.clipboard.writeText(text).catch(() => {})",
             caption,
         )
-        await asyncio.sleep(0.3)
+        await human_pause(0.2, 0.65)
         await page.keyboard.press("Control+v")
-        await asyncio.sleep(0.8)
+        await human_pause(0.5, 1.4)
 
     async def strategy_exec_command(field):
-        info("Strategy 2: execCommand insertText")
-        await field.click(timeout=5_000)
-        await asyncio.sleep(0.3)
+        info("Strategy 2: execCommand insertText (human-paced)")
+        await human_click(page, field, timeout=5_000)
+        await human_pause(0.2, 0.55)
         await page.evaluate(
             """(el, text) => {
                 el.focus();
@@ -1053,12 +1133,12 @@ async def enter_caption_lexical(page, caption: str) -> bool:
             }""",
             [field, caption],
         )
-        await asyncio.sleep(0.5)
+        await human_pause(0.35, 0.9)
 
     async def strategy_input_event(field):
-        info("Strategy 3: InputEvent dispatch")
-        await field.click(timeout=5_000)
-        await asyncio.sleep(0.3)
+        info("Strategy 3: InputEvent dispatch (human-paced)")
+        await human_click(page, field, timeout=5_000)
+        await human_pause(0.2, 0.55)
         await page.evaluate(
             """(el, text) => {
                 el.focus();
@@ -1083,18 +1163,20 @@ async def enter_caption_lexical(page, caption: str) -> bool:
             }""",
             [field, caption],
         )
-        await asyncio.sleep(0.5)
+        await human_pause(0.35, 0.9)
 
     async def strategy_keyboard_type(field):
-        info("Strategy 4: keyboard.type fallback")
-        await field.click(timeout=5_000)
-        await asyncio.sleep(0.3)
+        # Character-by-character with randomized per-key delay, occasional
+        # "thinking" pauses, and word-boundary pauses — see human_type().
+        info("Strategy 4: keyboard.type fallback (human-paced, char-by-char)")
+        await human_click(page, field, timeout=5_000)
+        await human_pause(0.2, 0.5)
         await page.keyboard.press("Control+a")
-        await asyncio.sleep(0.2)
+        await human_pause(0.1, 0.3)
         await page.keyboard.press("Backspace")
-        await asyncio.sleep(0.2)
-        await page.keyboard.type(caption, delay=20)
-        await asyncio.sleep(0.5)
+        await human_pause(0.15, 0.45)
+        await human_type(page, caption)
+        await human_pause(0.3, 0.85)
 
     strategies = [
         strategy_clipboard,
@@ -1243,7 +1325,7 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
         await save_screenshot(page, "FAIL_01_load")
         return False
 
-    await asyncio.sleep(8)
+    await human_wait(8)
     info(f"Current URL after load: {page.url}")
     info(f"URL type: {classify_url(page.url)}")
     await save_screenshot(page, "01_after_load")
@@ -1266,7 +1348,7 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
         await save_screenshot(page, "FAIL_03_nav")
         return False
 
-    await asyncio.sleep(8)
+    await human_wait(8)
     info(f"Current URL: {page.url}")
     info(f"URL type: {classify_url(page.url)}")
     await save_screenshot(page, "03_reels_create")
@@ -1285,6 +1367,7 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
             count = await inp.count()
             info(f"File input selector '{sel}': {count} found")
             if count > 0:
+                await human_pause(0.4, 1.1)
                 await inp.first.set_input_files(video_path)
                 ok(f"Video attached via direct input: {sel}")
                 uploaded = True
@@ -1310,6 +1393,7 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
                 info(f"Upload button '{btn_name}': {count} found")
                 if count == 0:
                     continue
+                await human_move_before_click(page, el)
                 async with page.expect_file_chooser(timeout=10_000) as fc_info:
                     await el.click(force=True)
                 fc = await fc_info.value
@@ -1357,7 +1441,7 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
             break
         if elapsed % 15 == 0:
             await save_screenshot(page, f"04_processing_{elapsed}s")
-        await asyncio.sleep(5)
+        await human_wait(5, 0.3)
 
     if not next_ready:
         warn("Next button never became active after 3 minutes")
@@ -1396,7 +1480,8 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
                 if disabled == "true":
                     continue
                 await btn.scroll_into_view_if_needed(timeout=5_000)
-                await btn.click(timeout=10_000)
+                await human_pause(0.15, 0.5)
+                await human_click(page, btn, timeout=10_000)
                 ok(f"Next clicked via: {sel}")
                 return True
             except Exception as e:
@@ -1429,7 +1514,7 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
                 ok(f"Caption field appeared {elapsed}s after Next click {next_attempt}")
                 caption_field_found = True
                 break
-            await asyncio.sleep(2)
+            await human_wait(2, 0.4)
 
         if caption_field_found:
             break
@@ -1497,10 +1582,11 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
                 label_text = await btn.inner_text()
                 info(f"Found button '{sel}' with text: {label_text!r}")
                 await btn.scroll_into_view_if_needed(timeout=5_000)
-                await btn.click(force=True)
+                await human_pause(0.15, 0.5)
+                await human_click(page, btn, force=True)
                 ok(f"Clicked '{label_text.strip()}' via: {sel}")
                 clicked_next2 = True
-                await asyncio.sleep(4)
+                await human_wait(4, 0.35)
                 break
             except Exception as e:
                 warn(f"Button '{sel}' failed: {e}")
@@ -1542,7 +1628,7 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
         if post_btn_found:
             break
         info(f"Waiting for Post button... {wait_elapsed}s")
-        await asyncio.sleep(2)
+        await human_wait(2, 0.4)
 
     if not post_btn_found:
         warn("Post button not yet visible — attempting click anyway")
@@ -1560,10 +1646,11 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
                 warn(f"  '{sel_name}' is disabled — skipping")
                 continue
             await btn.scroll_into_view_if_needed(timeout=5_000)
-            await btn.click(force=True)
+            await human_pause(0.2, 0.6)
+            await human_click(page, btn, force=True)
             ok(f"Post button clicked via: {sel_name}")
             post_clicked = True
-            await asyncio.sleep(5)
+            await human_wait(5, 0.3)
             break
         except Exception as e:
             warn(f"Post '{sel_name}' failed: {e}")
@@ -1600,7 +1687,7 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
         info(f"Waiting for confirmation... {elapsed}s")
         if elapsed % 15 == 0:
             await save_screenshot(page, f"09_waiting_confirm_{elapsed}s")
-        await asyncio.sleep(5)
+        await human_wait(5, 0.3)
 
     if not published:
         info("No explicit confirmation — checking page state...")
