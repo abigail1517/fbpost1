@@ -4,21 +4,41 @@ post_facebook.py  — VERBOSE DEBUG VERSION
 Every step prints exactly what it's doing and why it failed.
 Run with:  python -u post_facebook.py --once
 
-ALL runtime settings (Drive folders, loop interval, max runtime, captions)
+ALL runtime settings (Mega.nz folders, loop interval, max runtime, captions)
 are read from the Google Sheet at CAPTIONS_SHEET_ID / DEFAULT_CAPTIONS_SHEET_ID.
-Nothing except the Facebook session and Google credentials come from the
-GitHub Actions workflow anymore. See the SHEET HEADER COLUMNS section below.
+Videos live on Mega.nz and are accessed via rclone (remote name "mega",
+configured by the GitHub Actions workflow from the RCLONE_CONF_MEGA secret).
+Nothing except the Facebook session, Google credentials (for Sheets only),
+and the rclone config come from the GitHub Actions workflow. See the SHEET
+HEADER COLUMNS section below.
 
 SHEET HEADER COLUMNS (row 1 = headers, exact names, case-insensitive):
-  Caption               — the caption to post. It is NEVER cleared — the
-                           same caption row (row 2, first non-empty row)
-                           is reused every run. Each run, one or more URLs
-                           already inside the caption are swapped for fresh
-                           ones pulled from the 'Urls' tab (see below).
-  UploadFolderID         — Drive folder ID holding pending videos.
-                           Read from row 2 only.
-  UploadedFolderID        — Drive folder ID videos get moved to after a
+  Caption               — the caption to post WHEN this run includes a
+                           link (see Link_Percentage below). It is NEVER
+                           cleared — the same caption row (row 2, first
+                           non-empty row) is reused every run. Each time
+                           it's used, one or more URLs already inside it
+                           are swapped for fresh ones pulled from the
+                           'Urls' tab (see below).
+  WithoutLinkCap         — a separate caption used WHEN this run is
+                           chosen (by Link_Percentage) to post WITHOUT a
+                           link. Also never cleared / reused every time.
+                           No URL swapping ever happens on this caption.
+                           Optional — if left blank, runs fall back to
+                           the regular 'Caption' (with link) instead.
+  Link_Percentage        — 0–100. Read from row 2 only. Defaults to 100
+                           (always post WITH a link). Each run rolls a
+                           random 1–100 number; if it's ≤ Link_Percentage,
+                           the 'Caption' (with link) is used, otherwise
+                           'WithoutLinkCap' is used. E.g. 30 → roughly
+                           30% of runs post with a link, 70% without.
+  MegaFolder             — Mega.nz folder (path, relative to the mega
+                           remote root) holding pending videos.
+                           Read from row 2 only. Defaults to "fbreels"
+                           if blank/missing.
+  MegaMoveFolder         — Mega.nz folder videos get moved to after a
                            successful post. Read from row 2 only.
+                           Defaults to "fbreels_uploaded" if blank/missing.
   LoopIntervalMinutes    — minutes between posts. Read from row 2 only.
                            Defaults to 30 if blank/missing.
   MaxRuntimeMinutes      — total minutes this job runs before exiting
@@ -26,7 +46,8 @@ SHEET HEADER COLUMNS (row 1 = headers, exact names, case-insensitive):
                            Read from row 2 only. Defaults to 300 if blank.
   UrlReplaceCount        — how many URLs *inside the caption* to replace
                            each run. Read from row 2 only. Defaults to 1.
-                           Ignored when UrlReplaceEnabled is FALSE.
+                           Only applies on runs using 'Caption' (with a
+                           link). Ignored when UrlReplaceEnabled is FALSE.
   UrlReplaceMode         — "unique" (default) or "same". Read from row 2
                            only. Ignored when UrlReplaceEnabled is FALSE.
                              unique — each URL occurrence in the caption
@@ -40,7 +61,7 @@ SHEET HEADER COLUMNS (row 1 = headers, exact names, case-insensitive):
                                       pulled, used twice).
   UrlReplaceEnabled      — TRUE (default) or FALSE. Read from row 2 only.
                            Set to FALSE to skip URL swapping entirely and
-                           post the caption exactly as written — the
+                           post the 'Caption' exactly as written — the
                            'Urls' tab is not touched or read in that case.
 
 'Urls' TAB (same spreadsheet, separate tab named exactly "Urls"):
@@ -51,9 +72,52 @@ SHEET HEADER COLUMNS (row 1 = headers, exact names, case-insensitive):
                            URL is skipped on future runs (it is never
                            deleted). Add this header yourself if it isn't
                            already there.
+
+  FbStorageState         — (on the main tab, row 2, alongside Caption
+                           etc.) holds the Facebook session (Playwright
+                           storage_state JSON) as plain text. This is now
+                           the PRIMARY source for the session — no more
+                           relying on a GitHub secret that has to be
+                           refreshed via the GitHub CLI. On every run,
+                           after the browser closes, the script deletes
+                           whatever was in this cell and writes the fresh
+                           session back into it, so the sheet always holds
+                           the newest cookies and the login never goes
+                           stale between runs. FB_STORAGE_STATE (the old
+                           GitHub secret) is now only used as a one-time
+                           seed: if the sheet cell is empty (e.g. the very
+                           first run), the script falls back to it, then
+                           to a local storage_state.json file. Add this
+                           header yourself if it isn't already there —
+                           just paste your current session JSON into row 2
+                           once, and the script takes over refreshing it
+                           from there.
+
+─────────────────────────────────────────
+CHANGELOG (this version)
+─────────────────────────────────────────
+- Caption entry now types line-by-line with an explicit Enter keypress
+  between lines instead of relying on embedded "\n" characters inside a
+  single insertText/InputEvent/keyboard.type call. Facebook's Lexical
+  editor does not reliably turn a literal "\n" inside a pasted/inserted
+  string into a new paragraph node — it wants an actual Enter keypress
+  (or a real clipboard paste with proper HTML/line data) to create a new
+  line. This was the root cause of captions arriving "squished" (all
+  lines and hashtags running together) even though the script logged a
+  successful caption entry.
+- The browser context now explicitly grants clipboard-read/clipboard-write
+  permissions so the clipboard-paste strategy actually has a chance to
+  work in headless Chromium (previously navigator.clipboard.writeText()
+  could fail silently there, silently degrading to a worse strategy).
+- Success verification for caption entry no longer just checks "some text
+  landed" — it now compares the number of non-empty lines typed into the
+  field against the number of non-empty lines in the intended caption.
+  A strategy that squishes everything onto one line now correctly fails
+  verification and the script falls through to try the next strategy,
+  instead of silently reporting success on mangled output.
 """
 
-import asyncio, io, json, os, re, sys, tempfile, time
+import asyncio, json, os, random, re, subprocess, sys, tempfile, time
 from pathlib import Path
 from datetime import datetime
 import functools
@@ -68,16 +132,15 @@ try:
 except ImportError:
     HAS_SCHEDULE = False
 
-# ── Google Drive / Sheets ──────────────────────────────────────────────────────
+# ── Google Sheets (captions / settings / Urls tab only — no Drive) ────────────
 try:
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
     from googleapiclient.discovery import build
-    from googleapiclient.http import MediaIoBaseDownload
-    HAS_GDRIVE = True
+    HAS_GOOGLE = True
 except ImportError:
-    HAS_GDRIVE = False
-    print("⚠️  Google Drive libraries not installed")
+    HAS_GOOGLE = False
+    print("⚠️  Google API libraries not installed")
 
 from playwright.async_api import async_playwright
 
@@ -86,7 +149,7 @@ STORAGE_STATE         = "storage_state.json"
 SCREENSHOTS_DIR       = Path("screenshots")
 
 FB_STORAGE_STATE_ENV      = "FB_STORAGE_STATE"
-GDRIVE_CREDS_ENV          = "GOOGLE_CREDENTIALS_JSON"
+GOOGLE_CREDS_ENV          = "GOOGLE_CREDENTIALS_JSON"
 CAPTIONS_SHEET_ID_ENV     = "CAPTIONS_SHEET_ID"
 # Falls back to the sheet you shared if the env var / workflow input is blank
 DEFAULT_CAPTIONS_SHEET_ID = "1ICgS97JJ-Hrs9qsI1UV-xJvPg7ovmSHStGQPoOYr0Dk"
@@ -96,20 +159,27 @@ DEFAULT_MAX_RUNTIME_MINUTES   = 300
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
+# rclone remote name — must match the "[mega]" section name in rclone.conf
+MEGA_REMOTE_NAME          = "mega"
+DEFAULT_MEGA_FOLDER       = "fbreels"
+DEFAULT_MEGA_MOVE_FOLDER  = "fbreels_uploaded"
+
 # Header names expected in row 1 of the sheet (case-insensitive match)
 SETTINGS_COLUMNS = {
-    "upload_folder_id":      "UploadFolderID",
-    "uploaded_folder_id":    "UploadedFolderID",
+    "mega_folder":           "MegaFolder",
+    "mega_move_folder":      "MegaMoveFolder",
     "loop_interval_minutes": "LoopIntervalMinutes",
     "max_runtime_minutes":   "MaxRuntimeMinutes",
     "url_replace_count":     "UrlReplaceCount",
     "url_replace_mode":      "UrlReplaceMode",
     "url_replace_enabled":   "UrlReplaceEnabled",
+    "link_percentage":       "Link_Percentage",
 }
 
 DEFAULT_URL_REPLACE_COUNT   = 1
 DEFAULT_URL_REPLACE_MODE    = "unique"   # "unique" or "same"
 DEFAULT_URL_REPLACE_ENABLED = True
+DEFAULT_LINK_PERCENTAGE     = 100        # 100 = always post WITH a link (old behavior)
 
 # 'Urls' tab config
 URLS_SHEET_NAME         = "Urls"
@@ -117,6 +187,11 @@ URLS_COLUMN_NAME        = "Urls"
 URLS_STATUS_COLUMN_NAME = "Status"
 URLS_POSTED_VALUES      = {"posted", "replaced"}  # values treated as "already used"
 URL_REGEX                = re.compile(r'https?://\S+')
+
+# Main-tab column that stores the Facebook session (Playwright storage_state
+# JSON) so it can be refreshed every run without a GitHub secret.
+FB_STORAGE_STATE_COLUMN_NAME = "FbStorageState"
+SHEETS_CELL_CHAR_LIMIT       = 50000  # Google Sheets per-cell text limit
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP LOGGER
@@ -136,19 +211,19 @@ def fail(msg):   print(f"   ❌ {msg}")
 def debug(msg):  print(f"   🔍 {msg}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Google credentials / services
+# Google credentials / Sheets service (Sheets only — no Drive)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_google_creds():
-    step("Building Google credentials")
-    if not HAS_GDRIVE:
+    step("Building Google credentials (Sheets)")
+    if not HAS_GOOGLE:
         fail("google-auth not installed")
         raise RuntimeError("Missing google-auth libraries")
 
-    creds_json = os.environ.get(GDRIVE_CREDS_ENV)
+    creds_json = os.environ.get(GOOGLE_CREDS_ENV)
     if not creds_json:
-        fail(f"Env var {GDRIVE_CREDS_ENV} is not set")
-        raise RuntimeError(f"Missing {GDRIVE_CREDS_ENV}")
+        fail(f"Env var {GOOGLE_CREDS_ENV} is not set")
+        raise RuntimeError(f"Missing {GOOGLE_CREDS_ENV}")
 
     info(f"GOOGLE_CREDENTIALS_JSON length: {len(creds_json)} chars")
 
@@ -172,11 +247,8 @@ def build_google_creds():
         token_uri     = creds_data.get("token_uri", "https://oauth2.googleapis.com/token"),
         client_id     = creds_data.get("client_id"),
         client_secret = creds_data.get("client_secret"),
-        # NOTE: your GOOGLE_CREDENTIALS_JSON's refresh token must have been
-        # issued with BOTH scopes below, or the Sheets call will fail with
-        # an insufficient-permissions error even though Drive still works.
+        # Videos are no longer on Drive, so only the Sheets scope is needed.
         scopes        = creds_data.get("scopes", [
-            "https://www.googleapis.com/auth/drive",
             "https://www.googleapis.com/auth/spreadsheets",
         ]),
     )
@@ -195,13 +267,6 @@ def build_google_creds():
     return creds
 
 
-def build_drive_service(creds):
-    step("Building Google Drive service")
-    service = build("drive", "v3", credentials=creds, cache_discovery=False)
-    ok("Google Drive service built")
-    return service
-
-
 def build_sheets_service(creds):
     step("Building Google Sheets service")
     service = build("sheets", "v4", credentials=creds, cache_discovery=False)
@@ -209,67 +274,89 @@ def build_sheets_service(creds):
     return service
 
 
-def gdrive_list_videos(service, folder_id: str) -> list[dict]:
-    step(f"Listing videos in Drive folder: {folder_id}")
-    ext_filter = " or ".join(f"name contains '{ext}'" for ext in VIDEO_EXTENSIONS)
-    query = f"'{folder_id}' in parents and trashed = false and ({ext_filter})"
-    info(f"Query: {query}")
+# ─────────────────────────────────────────────────────────────────────────────
+# Mega.nz (via rclone) — video storage
+# ─────────────────────────────────────────────────────────────────────────────
 
+def _run_rclone(args: list[str], timeout: int = 300):
+    """Runs an rclone command, returns (returncode, stdout, stderr)."""
+    cmd = ["rclone"] + args
+    info(f"Running: {' '.join(cmd)}")
     try:
-        result = service.files().list(
-            q=query,
-            fields="files(id, name, mimeType, createdTime, size)",
-            orderBy="createdTime",
-            pageSize=10,
-        ).execute()
-    except Exception as e:
-        fail(f"Drive API list failed: {e}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        fail("rclone is not installed / not on PATH — check the workflow's rclone install step")
+        raise
+    except subprocess.TimeoutExpired:
+        fail(f"rclone command timed out after {timeout}s")
         raise
 
-    files = result.get("files", [])
-    info(f"Found {len(files)} video(s)")
-    for f in files:
-        size_mb = int(f.get("size", 0)) // (1024 * 1024)
-        info(f"  • {f['name']}  ({size_mb} MB)  id={f['id']}")
-    return files
+    if result.stdout.strip():
+        debug(f"stdout: {result.stdout.strip()[:500]}")
+    if result.returncode != 0:
+        warn(f"rclone exited with code {result.returncode}")
+        if result.stderr.strip():
+            warn(f"stderr: {result.stderr.strip()[:1000]}")
+    return result.returncode, result.stdout, result.stderr
 
 
-def gdrive_download_video(service, file_id: str, file_name: str, dest_dir: str) -> str:
-    step(f"Downloading video: {file_name} (id={file_id})")
+def mega_list_videos(folder: str) -> list[dict]:
+    step(f"Listing videos in Mega.nz folder: {folder}")
+    remote_path = f"{MEGA_REMOTE_NAME}:{folder}"
+    returncode, stdout, stderr = _run_rclone(["lsjson", remote_path, "--files-only"])
+    if returncode != 0:
+        fail(f"rclone lsjson failed for {remote_path}: {stderr.strip()[:300]}")
+        raise RuntimeError(f"rclone lsjson failed: {stderr.strip()[:300]}")
+
+    try:
+        entries = json.loads(stdout) if stdout.strip() else []
+    except json.JSONDecodeError as e:
+        fail(f"Could not parse rclone lsjson output: {e}")
+        raise
+
+    videos = [
+        e for e in entries
+        if Path(e.get("Name", "")).suffix.lower() in VIDEO_EXTENSIONS
+    ]
+    videos.sort(key=lambda e: e.get("ModTime", ""))  # oldest first, like before
+
+    info(f"Found {len(videos)} video(s)")
+    for v in videos:
+        size_mb = int(v.get("Size", 0) or 0) // (1024 * 1024)
+        info(f"  • {v.get('Name')}  ({size_mb} MB)")
+    return videos
+
+
+def mega_download_video(folder: str, file_name: str, dest_dir: str) -> str:
+    step(f"Downloading video from Mega.nz: {file_name}")
+    remote_path = f"{MEGA_REMOTE_NAME}:{folder}/{file_name}"
     dest_path = os.path.join(dest_dir, file_name)
 
-    try:
-        request = service.files().get_media(fileId=file_id)
-        with io.FileIO(dest_path, "wb") as fh:
-            downloader = MediaIoBaseDownload(fh, request, chunksize=8 * 1024 * 1024)
-            done = False
-            while not done:
-                status, done = downloader.next_chunk()
-                if status:
-                    print(f"   📥 {int(status.progress() * 100)}%", end="\r")
-        print()
-    except Exception as e:
-        fail(f"Download failed: {e}")
-        raise
+    returncode, stdout, stderr = _run_rclone(
+        ["copyto", remote_path, dest_path, "--progress"], timeout=1800,
+    )
+    if returncode != 0:
+        fail(f"rclone copyto failed: {stderr.strip()[:300]}")
+        raise RuntimeError(f"rclone download failed: {stderr.strip()[:300]}")
+
+    if not os.path.exists(dest_path):
+        fail(f"Download reported success but file not found: {dest_path}")
+        raise RuntimeError("Downloaded file missing after rclone copyto")
 
     size_mb = os.path.getsize(dest_path) // (1024 * 1024)
     ok(f"Downloaded to: {dest_path}  ({size_mb} MB)")
     return dest_path
 
 
-def gdrive_move_to_uploaded(service, file_id, file_name, src_folder_id, dst_folder_id):
-    step(f"Moving '{file_name}' to uploaded folder")
-    try:
-        service.files().update(
-            fileId=file_id,
-            addParents=dst_folder_id,
-            removeParents=src_folder_id,
-            fields="id, parents",
-        ).execute()
-        ok(f"Moved successfully")
-    except Exception as e:
-        fail(f"Move failed: {e}")
-        raise
+def mega_move_to_uploaded(src_folder: str, dst_folder: str, file_name: str):
+    step(f"Moving '{file_name}' to Mega.nz uploaded folder")
+    src = f"{MEGA_REMOTE_NAME}:{src_folder}/{file_name}"
+    dst = f"{MEGA_REMOTE_NAME}:{dst_folder}/{file_name}"
+    returncode, stdout, stderr = _run_rclone(["moveto", src, dst])
+    if returncode != 0:
+        fail(f"rclone moveto failed: {stderr.strip()[:300]}")
+        raise RuntimeError(f"rclone move failed: {stderr.strip()[:300]}")
+    ok("Moved successfully")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -289,7 +376,7 @@ def _read_sheet_rows(sheets_service, spreadsheet_id, range_str="A:Z"):
 
 def sheet_get_settings(sheets_service, spreadsheet_id: str) -> dict:
     """
-    Reads UploadFolderID / UploadedFolderID / LoopIntervalMinutes /
+    Reads MegaFolder / MegaMoveFolder / LoopIntervalMinutes /
     MaxRuntimeMinutes from row 2 of the sheet (matched by header name in
     row 1). Returns a dict with whichever keys were found — missing or
     blank values are simply absent, callers apply their own defaults.
@@ -321,17 +408,15 @@ def sheet_get_settings(sheets_service, spreadsheet_id: str) -> dict:
     return settings
 
 
-def sheet_get_caption(sheets_service, spreadsheet_id: str):
+def _sheet_get_named_column(sheets_service, spreadsheet_id: str, column_name: str, required: bool = True):
     """
-    Finds the 'Caption' column and returns the first non-empty caption
-    found below the header, along with its row/column index.
-
-    NOTE: the caption is intentionally NEVER cleared by this script
-    anymore — the same caption is reused on every run. Only the URL
-    inside it changes (see sheet_get_next_url / replace_url_in_caption).
-    Returns (caption, row_num, col_idx) or (None, None, None).
+    Generic helper: finds `column_name` (case-insensitive) in row 1 and
+    returns the first non-empty value found below it, along with its
+    row/column index. The cell is NEVER cleared here — callers reuse the
+    same value every run. Returns (value, row_num, col_idx) or
+    (None, None, None).
     """
-    step(f"Fetching caption from Google Sheet: {spreadsheet_id}")
+    step(f"Fetching '{column_name}' from Google Sheet: {spreadsheet_id}")
     rows = _read_sheet_rows(sheets_service, spreadsheet_id)
     if not rows:
         warn("Sheet appears empty")
@@ -342,24 +427,125 @@ def sheet_get_caption(sheets_service, spreadsheet_id: str):
 
     col_idx = None
     for i, h in enumerate(header):
-        if h.strip().lower() == "caption":
+        if h.strip().lower() == column_name.lower():
             col_idx = i
             break
 
     if col_idx is None:
-        fail("No 'Caption' column found in header row — check your sheet headers")
+        msg = f"No '{column_name}' column found in header row"
+        if required:
+            fail(msg)
+        else:
+            warn(msg)
         return None, None, None
 
-    info(f"'Caption' column found at index {col_idx} (column {chr(ord('A') + col_idx)})")
+    info(f"'{column_name}' column found at index {col_idx} (column {chr(ord('A') + col_idx)})")
 
     for row_num, row in enumerate(rows[1:], start=2):
         if len(row) > col_idx and row[col_idx].strip():
-            caption = row[col_idx].strip()
-            ok(f"Caption found at row {row_num}: {caption[:80]}")
-            return caption, row_num, col_idx
+            value = row[col_idx].strip()
+            ok(f"'{column_name}' found at row {row_num}: {value[:80]}")
+            return value, row_num, col_idx
 
-    warn("No caption found in sheet (all rows empty)")
+    warn(f"No value found in '{column_name}' column (all rows empty)")
     return None, None, None
+
+
+def sheet_get_caption(sheets_service, spreadsheet_id: str):
+    """
+    Finds the 'Caption' column and returns the first non-empty caption
+    found below the header, along with its row/column index. This is the
+    caption used on runs that post WITH a link.
+
+    NOTE: the caption is intentionally NEVER cleared by this script
+    anymore — the same caption is reused on every run. Only the URL(s)
+    inside it change (see sheet_get_next_urls / replace_urls_in_caption).
+    Returns (caption, row_num, col_idx) or (None, None, None).
+    """
+    return _sheet_get_named_column(sheets_service, spreadsheet_id, "Caption", required=True)
+
+
+def sheet_get_withoutlink_caption(sheets_service, spreadsheet_id: str):
+    """
+    Finds the 'WithoutLinkCap' column and returns the first non-empty
+    value found below it — the caption used on runs that post WITHOUT a
+    link (chosen via Link_Percentage). Optional column: if it's missing
+    or empty, callers should fall back to the regular 'Caption'. Never
+    cleared, same value reused every time it's picked.
+    Returns (caption, row_num, col_idx) or (None, None, None).
+    """
+    return _sheet_get_named_column(sheets_service, spreadsheet_id, "WithoutLinkCap", required=False)
+
+
+def _sheet_find_column_index(sheets_service, spreadsheet_id: str, column_name: str):
+    """Returns the 0-based index of `column_name` in row 1, or None if not found."""
+    rows = _read_sheet_rows(sheets_service, spreadsheet_id)
+    if not rows:
+        return None
+    header = rows[0]
+    for i, h in enumerate(header):
+        if h.strip().lower() == column_name.lower():
+            return i
+    return None
+
+
+def sheet_get_fb_storage_state(sheets_service, spreadsheet_id: str):
+    """
+    Reads the current Facebook session (storage_state JSON) from the
+    'FbStorageState' column, row 2. This is the primary source for the
+    session now — refreshed by sheet_set_fb_storage_state() after every
+    run so it never goes stale. Optional column: if missing/empty,
+    callers should fall back to the FB_STORAGE_STATE env var / local file.
+    Returns (json_str, row_num, col_idx) or (None, None, None).
+    """
+    return _sheet_get_named_column(
+        sheets_service, spreadsheet_id, FB_STORAGE_STATE_COLUMN_NAME, required=False
+    )
+
+
+def sheet_set_fb_storage_state(sheets_service, spreadsheet_id: str, storage_state_json: str):
+    """
+    Refreshes the Facebook session stored in the 'FbStorageState' column
+    (row 2): the OLD value is deleted first, then the fresh session JSON
+    is written in its place, so the sheet always holds exactly one
+    up-to-date session and the login never expires between runs. If the
+    'FbStorageState' header doesn't exist yet, this just warns and does
+    nothing (add the header once to enable sheet-based session storage).
+    """
+    step(f"Refreshing '{FB_STORAGE_STATE_COLUMN_NAME}' in Google Sheet")
+
+    if len(storage_state_json) > SHEETS_CELL_CHAR_LIMIT:
+        warn(f"Session JSON is {len(storage_state_json)} chars, over the "
+             f"{SHEETS_CELL_CHAR_LIMIT}-char Google Sheets cell limit — "
+             f"cannot store it in the sheet this run")
+        return
+
+    col_idx = _sheet_find_column_index(sheets_service, spreadsheet_id, FB_STORAGE_STATE_COLUMN_NAME)
+    if col_idx is None:
+        warn(f"No '{FB_STORAGE_STATE_COLUMN_NAME}' column found in header row — "
+             f"add this header (row 2 will hold the session JSON) to enable "
+             f"sheet-based session refresh. Skipping for now.")
+        return
+
+    col_letter = chr(ord('A') + col_idx)
+    cell_range = f"{col_letter}2"
+
+    try:
+        # Delete the old session first...
+        sheets_service.spreadsheets().values().clear(
+            spreadsheetId=spreadsheet_id, range=cell_range, body={}
+        ).execute()
+        # ...then write the fresh one in its place.
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=cell_range,
+            valueInputOption="RAW",
+            body={"values": [[storage_state_json]]},
+        ).execute()
+        ok(f"'{FB_STORAGE_STATE_COLUMN_NAME}' cell {cell_range} refreshed "
+           f"with the latest session ({len(storage_state_json)} chars)")
+    except Exception as e:
+        warn(f"Could not refresh '{FB_STORAGE_STATE_COLUMN_NAME}' in sheet: {e}")
 
 
 def sheet_get_next_urls(sheets_service, spreadsheet_id: str, count: int):
@@ -576,8 +762,31 @@ def fetch_loop_timing():
 # Facebook / Playwright helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def resolve_fb_storage_state() -> str | None:
+def resolve_fb_storage_state(sheets_service=None, spreadsheet_id=None) -> str | None:
     step("Resolving Facebook storage state")
+
+    # 1) PRIMARY: the 'FbStorageState' cell in the Google Sheet — this is
+    #    kept fresh every run by sheet_set_fb_storage_state(), so it's the
+    #    most reliable source and avoids GitHub-secret refresh entirely.
+    if sheets_service is not None and spreadsheet_id:
+        sheet_val, _row, _col = sheet_get_fb_storage_state(sheets_service, spreadsheet_id)
+        if sheet_val:
+            info(f"'{FB_STORAGE_STATE_COLUMN_NAME}' found in sheet, length={len(sheet_val)}")
+            try:
+                parsed = json.loads(sheet_val)
+                cookies = parsed.get("cookies", [])
+                ok(f"Valid JSON from sheet — {len(cookies)} cookies found")
+                for c in cookies:
+                    info(f"  Cookie: name={c.get('name')} expires={c.get('expires')} domain={c.get('domain')}")
+                return sheet_val
+            except json.JSONDecodeError as e:
+                fail(f"'{FB_STORAGE_STATE_COLUMN_NAME}' in sheet is not valid JSON: {e}")
+        else:
+            warn(f"'{FB_STORAGE_STATE_COLUMN_NAME}' column empty/missing in sheet — "
+                 f"falling back to FB_STORAGE_STATE env var / local file")
+
+    # 2) FALLBACK: FB_STORAGE_STATE env var (secret) — useful as a one-time
+    #    seed before the sheet has ever been populated.
     env_val = os.environ.get(FB_STORAGE_STATE_ENV)
     if env_val:
         info(f"FB_STORAGE_STATE env var found, length={len(env_val)}")
@@ -593,6 +802,7 @@ def resolve_fb_storage_state() -> str | None:
     else:
         warn("FB_STORAGE_STATE env var not set")
 
+    # 3) LAST RESORT: a local storage_state.json left over from a previous run.
     if Path(STORAGE_STATE).exists():
         info(f"Found local {STORAGE_STATE} — using it")
         return Path(STORAGE_STATE).read_text(encoding="utf-8")
@@ -800,11 +1010,31 @@ async def ensure_logged_in(page) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Caption entry — handles Lexical editor with 4 fallback strategies
+# Caption entry — handles Lexical editor with line-aware fallback strategies
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _nonempty_lines(text: str) -> list[str]:
+    return [l for l in text.split("\n") if l.strip()]
+
+
+async def _clear_field(page, field):
+    await field.click(timeout=5_000)
+    await asyncio.sleep(0.3)
+    await page.keyboard.press("Control+a")
+    await asyncio.sleep(0.2)
+    await page.keyboard.press("Backspace")
+    await asyncio.sleep(0.2)
+
+
 async def enter_caption_lexical(page, caption: str) -> bool:
-    """Try 4 strategies to paste text into Facebook's Lexical editor."""
+    """
+    Try several strategies to get `caption` into Facebook's Lexical
+    editor, in order of fidelity. Each strategy is verified by comparing
+    the number of non-empty lines that actually landed in the field
+    against the number of non-empty lines in the intended caption — not
+    just "some text is present" — since a squished, single-line result
+    still contains all the characters but is not a correct caption.
+    """
     LEXICAL_SELECTORS = [
         'div[data-lexical-editor="true"][contenteditable="true"]',
         'div[contenteditable="true"][aria-placeholder="Describe your reel..."]',
@@ -812,14 +1042,31 @@ async def enter_caption_lexical(page, caption: str) -> bool:
         'div[contenteditable="true"]',
     ]
 
+    expected_lines = len(_nonempty_lines(caption))
+
+    async def strategy_keyboard_type_lines(field):
+        # PRIMARY strategy: type each line separately and press a real
+        # Enter key between lines. This is what reliably creates new
+        # paragraph nodes in Lexical — embedding "\n" inside a single
+        # insertText/InputEvent/keyboard.type call does not.
+        info("Strategy 1: keyboard.type line-by-line with explicit Enter")
+        await _clear_field(page, field)
+        lines = caption.split("\n")
+        for i, line in enumerate(lines):
+            if line:
+                await page.keyboard.type(line, delay=12)
+            if i < len(lines) - 1:
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(0.05)
+        await asyncio.sleep(0.5)
+
     async def strategy_clipboard(field):
-        info("Strategy 1: clipboard paste via Ctrl+V")
-        await field.click(timeout=5_000)
-        await asyncio.sleep(0.4)
-        await page.keyboard.press("Control+a")
-        await asyncio.sleep(0.2)
-        await page.keyboard.press("Backspace")
-        await asyncio.sleep(0.2)
+        # Real clipboard paste — Lexical's paste handler understands
+        # line breaks correctly when the clipboard actually contains
+        # text with real newlines. Requires clipboard-write/read
+        # permissions to be granted on the browser context.
+        info("Strategy 2: clipboard paste via Ctrl+V")
+        await _clear_field(page, field)
         await page.evaluate(
             "(text) => navigator.clipboard.writeText(text).catch(() => {})",
             caption,
@@ -828,67 +1075,72 @@ async def enter_caption_lexical(page, caption: str) -> bool:
         await page.keyboard.press("Control+v")
         await asyncio.sleep(0.8)
 
-    async def strategy_exec_command(field):
-        info("Strategy 2: execCommand insertText")
-        await field.click(timeout=5_000)
-        await asyncio.sleep(0.3)
-        await page.evaluate(
-            """(el, text) => {
-                el.focus();
-                document.execCommand('selectAll', false, null);
-                document.execCommand('delete', false, null);
-                document.execCommand('insertText', false, text);
-            }""",
-            [field, caption],
-        )
+    async def strategy_exec_command_per_line(field):
+        # execCommand insertText per line + insertParagraph between
+        # lines, rather than a single blob containing "\n".
+        info("Strategy 3: execCommand insertText per line")
+        await _clear_field(page, field)
+        lines = caption.split("\n")
+        for i, line in enumerate(lines):
+            if line:
+                await page.evaluate(
+                    """(el, text) => {
+                        el.focus();
+                        document.execCommand('insertText', false, text);
+                    }""",
+                    [field, line],
+                )
+            if i < len(lines) - 1:
+                await page.evaluate(
+                    """(el) => {
+                        el.focus();
+                        document.execCommand('insertParagraph', false, null);
+                    }""",
+                    field,
+                )
+            await asyncio.sleep(0.05)
         await asyncio.sleep(0.5)
 
-    async def strategy_input_event(field):
-        info("Strategy 3: InputEvent dispatch")
-        await field.click(timeout=5_000)
-        await asyncio.sleep(0.3)
-        await page.evaluate(
-            """(el, text) => {
-                el.focus();
-                const sel = window.getSelection();
-                const range = document.createRange();
-                range.selectNodeContents(el);
-                sel.removeAllRanges();
-                sel.addRange(range);
-                const ev = new InputEvent('beforeinput', {
-                    inputType: 'insertText',
-                    data: text,
-                    bubbles: true,
-                    cancelable: true,
-                });
-                el.dispatchEvent(ev);
-                const ev2 = new InputEvent('input', {
-                    inputType: 'insertText',
-                    data: text,
-                    bubbles: true,
-                });
-                el.dispatchEvent(ev2);
-            }""",
-            [field, caption],
-        )
-        await asyncio.sleep(0.5)
-
-    async def strategy_keyboard_type(field):
-        info("Strategy 4: keyboard.type fallback")
-        await field.click(timeout=5_000)
-        await asyncio.sleep(0.3)
-        await page.keyboard.press("Control+a")
-        await asyncio.sleep(0.2)
-        await page.keyboard.press("Backspace")
-        await asyncio.sleep(0.2)
-        await page.keyboard.type(caption, delay=20)
+    async def strategy_input_event_per_line(field):
+        # InputEvent dispatch per line, with a separate Enter keypress
+        # (real KeyboardEvent, not just an inserted character) between
+        # lines so Lexical's key handler creates a new block.
+        info("Strategy 4: InputEvent dispatch per line + Enter keypress")
+        await _clear_field(page, field)
+        lines = caption.split("\n")
+        for i, line in enumerate(lines):
+            if line:
+                await page.evaluate(
+                    """(el, text) => {
+                        el.focus();
+                        const sel = window.getSelection();
+                        const range = document.createRange();
+                        range.selectNodeContents(el);
+                        range.collapse(false);
+                        sel.removeAllRanges();
+                        sel.addRange(range);
+                        const ev = new InputEvent('beforeinput', {
+                            inputType: 'insertText', data: text,
+                            bubbles: true, cancelable: true,
+                        });
+                        el.dispatchEvent(ev);
+                        const ev2 = new InputEvent('input', {
+                            inputType: 'insertText', data: text, bubbles: true,
+                        });
+                        el.dispatchEvent(ev2);
+                    }""",
+                    [field, line],
+                )
+            if i < len(lines) - 1:
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(0.05)
         await asyncio.sleep(0.5)
 
     strategies = [
+        strategy_keyboard_type_lines,
         strategy_clipboard,
-        strategy_exec_command,
-        strategy_input_event,
-        strategy_keyboard_type,
+        strategy_exec_command_per_line,
+        strategy_input_event_per_line,
     ]
 
     for i, strategy in enumerate(strategies, 1):
@@ -901,9 +1153,15 @@ async def enter_caption_lexical(page, caption: str) -> bool:
                 txt = await field.evaluate(
                     "el => (el.innerText || el.textContent || '').trim()"
                 )
-                if txt and len(txt) > 2:
-                    ok(f"Caption entered via strategy {i} / selector '{sel}' ({len(txt)} chars)")
+                actual_lines = len(_nonempty_lines(txt))
+                if txt and len(txt) > 2 and abs(actual_lines - expected_lines) <= 1:
+                    ok(f"Caption entered via strategy {i} / selector '{sel}' "
+                       f"({len(txt)} chars, {actual_lines}/{expected_lines} lines matched)")
                     return True
+                elif txt and len(txt) > 2:
+                    warn(f"Strategy {i} / '{sel}': text landed but line count "
+                         f"mismatch ({actual_lines} vs expected {expected_lines}) "
+                         f"— likely squished, trying next strategy")
                 else:
                     warn(f"Strategy {i} / '{sel}': field empty after attempt")
             except Exception as e:
@@ -916,7 +1174,7 @@ async def enter_caption_lexical(page, caption: str) -> bool:
 # Upload flow
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def upload_reel(caption: str, video_path: str) -> bool:
+async def upload_reel(caption: str, video_path: str, sheets_service=None, spreadsheet_id=None) -> bool:
     step("Starting Facebook Reel upload")
     if not Path(video_path).exists():
         fail(f"Video file not found: {video_path}")
@@ -944,7 +1202,7 @@ async def upload_reel(caption: str, video_path: str) -> bool:
             fail(f"Browser launch FAILED: {e}")
             return False
 
-        storage_state_json = resolve_fb_storage_state()
+        storage_state_json = resolve_fb_storage_state(sheets_service, spreadsheet_id)
         if not storage_state_json:
             fail("No Facebook session available — aborting")
             await browser.close()
@@ -973,6 +1231,18 @@ async def upload_reel(caption: str, video_path: str) -> bool:
             await browser.close()
             return False
 
+        # Grant clipboard permissions so the clipboard-paste caption
+        # strategy actually has a chance to work in headless Chromium —
+        # without this, navigator.clipboard.writeText() can fail silently.
+        step("Granting clipboard permissions")
+        try:
+            await context.grant_permissions(
+                ["clipboard-read", "clipboard-write"], origin="https://www.facebook.com"
+            )
+            ok("Clipboard permissions granted for facebook.com")
+        except Exception as e:
+            warn(f"Could not grant clipboard permissions: {e}")
+
         published = False
         try:
             published = await _run_upload_flow(context, caption, video_path)
@@ -983,8 +1253,19 @@ async def upload_reel(caption: str, video_path: str) -> bool:
         finally:
             try:
                 fresh = await context.storage_state()
-                Path(STORAGE_STATE).write_text(json.dumps(fresh), encoding="utf-8")
-                ok(f"Saved refreshed storage_state ({len(fresh.get('cookies', []))} cookies)")
+                fresh_json = json.dumps(fresh)
+                Path(STORAGE_STATE).write_text(fresh_json, encoding="utf-8")
+                ok(f"Saved refreshed storage_state locally ({len(fresh.get('cookies', []))} cookies)")
+
+                # Persist the refreshed session back to the Google Sheet so
+                # the next run (even a fresh GitHub Actions job with no
+                # local files) picks up the newest cookies instead of an
+                # expiring GitHub secret.
+                if sheets_service is not None and spreadsheet_id:
+                    sheet_set_fb_storage_state(sheets_service, spreadsheet_id, fresh_json)
+                else:
+                    warn("No Sheets service/spreadsheet ID available — "
+                         "could not refresh the session in the Google Sheet")
             except Exception as e:
                 warn(f"Could not save storage_state: {e}")
             await browser.close()
@@ -1210,12 +1491,15 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
 
     # ── Step 6: Enter caption ─────────────────────────────────────────────
     step("Entering caption text")
-    info(f"Caption to type ({len(caption)} chars): {caption[:80]}")
+    info(f"Caption to type ({len(caption)} chars, "
+         f"{len(_nonempty_lines(caption))} non-empty lines): {caption[:80]}")
 
     caption_ok = await enter_caption_lexical(page, caption)
 
     if not caption_ok:
-        warn("Caption could not be entered — continuing anyway (post may have no caption)")
+        warn("Caption could not be entered with correct line breaks after all "
+             "strategies — continuing anyway (post may have a squished or "
+             "missing caption; check 06_after_caption.png)")
     await save_screenshot(page, "06_after_caption")
 
     # ── Step 7: Advance to Post panel if needed ───────────────────────────
@@ -1412,13 +1696,13 @@ def run_once():
 
     step("Checking environment variables")
     info(f"{CAPTIONS_SHEET_ID_ENV}: {os.environ.get(CAPTIONS_SHEET_ID_ENV) or '(using default sheet)'}")
-    for secret in [FB_STORAGE_STATE_ENV, GDRIVE_CREDS_ENV]:
+    for secret in [FB_STORAGE_STATE_ENV, GOOGLE_CREDS_ENV]:
         val = os.environ.get(secret, "")
         info(f"{secret}: {'SET (' + str(len(val)) + ' chars)' if val else 'NOT SET'}")
+    info(f"Mega.nz remote (rclone): '{MEGA_REMOTE_NAME}' (configured via rclone.conf in the workflow)")
 
     try:
         creds          = build_google_creds()
-        service        = build_drive_service(creds)
         sheets_service = build_sheets_service(creds)
     except Exception as e:
         fail(f"Google service setup failed: {e}")
@@ -1427,28 +1711,46 @@ def run_once():
     captions_sheet_id = os.environ.get(CAPTIONS_SHEET_ID_ENV) or DEFAULT_CAPTIONS_SHEET_ID
 
     settings = sheet_get_settings(sheets_service, captions_sheet_id)
-    upload_folder   = settings.get("upload_folder_id")
-    uploaded_folder = settings.get("uploaded_folder_id")
+    mega_folder      = settings.get("mega_folder") or DEFAULT_MEGA_FOLDER
+    mega_move_folder = settings.get("mega_move_folder") or DEFAULT_MEGA_MOVE_FOLDER
+    info(f"Mega.nz source folder: {mega_folder}")
+    info(f"Mega.nz move-to-uploaded folder: {mega_move_folder}")
 
-    if not upload_folder:
-        fail("UploadFolderID is missing/empty in the sheet (row 2) — cannot continue")
-        return
-    if not uploaded_folder:
-        fail("UploadedFolderID is missing/empty in the sheet (row 2) — cannot continue")
-        return
+    # ── Decide WITH-link vs WITHOUT-link caption for this run ───────────
+    link_percentage = _to_int(settings.get("link_percentage"), DEFAULT_LINK_PERCENTAGE)
+    link_percentage = max(0, min(100, link_percentage))
+    roll = random.randint(1, 100)
+    use_link_caption = roll <= link_percentage
+    info(f"Link_Percentage={link_percentage}% — roll={roll}/100 → "
+         f"{'WITH link (Caption)' if use_link_caption else 'WITHOUT link (WithoutLinkCap)'}")
 
-    # Caption is reused every run — it is never cleared.
-    caption, cap_row, cap_col = sheet_get_caption(sheets_service, captions_sheet_id)
-    if not caption:
-        fail("No caption available in the Google Sheet — aborting this run "
-             "(add a value to the 'Caption' column)")
-        return
+    if use_link_caption:
+        caption, cap_row, cap_col = sheet_get_caption(sheets_service, captions_sheet_id)
+        if not caption:
+            fail("No caption available in the Google Sheet — aborting this run "
+                 "(add a value to the 'Caption' column)")
+            return
+    else:
+        caption, cap_row, cap_col = sheet_get_withoutlink_caption(sheets_service, captions_sheet_id)
+        if not caption:
+            warn("'WithoutLinkCap' column is empty or missing — falling back to the "
+                 "regular 'Caption' (with link) for this run instead")
+            use_link_caption = True
+            caption, cap_row, cap_col = sheet_get_caption(sheets_service, captions_sheet_id)
+            if not caption:
+                fail("No caption available in the Google Sheet — aborting this run "
+                     "(add a value to the 'Caption' or 'WithoutLinkCap' column)")
+                return
 
-    # ── URL replacement settings ────────────────────────────────────────
-    url_replace_enabled = _to_bool(settings.get("url_replace_enabled"), DEFAULT_URL_REPLACE_ENABLED)
+    # ── URL replacement settings (only ever applies to the WITH-link caption) ─
+    url_replace_enabled = use_link_caption and _to_bool(
+        settings.get("url_replace_enabled"), DEFAULT_URL_REPLACE_ENABLED
+    )
     new_urls, used_rows, url_col_idx, status_col_idx = [], [], None, None
 
-    if not url_replace_enabled:
+    if not use_link_caption:
+        info("Posting WITHOUT a link this run — 'Urls' tab not touched")
+    elif not url_replace_enabled:
         info("UrlReplaceEnabled is FALSE — posting caption as-is, 'Urls' tab not touched")
     else:
         url_replace_count = _to_int(settings.get("url_replace_count"), DEFAULT_URL_REPLACE_COUNT)
@@ -1482,29 +1784,33 @@ def run_once():
                  f"posting caption without swapping any URL")
 
     try:
-        videos = gdrive_list_videos(service, upload_folder)
+        videos = mega_list_videos(mega_folder)
     except Exception as e:
-        fail(f"Could not list Drive folder: {e}")
+        fail(f"Could not list Mega.nz folder: {e}")
         return
 
     if not videos:
-        info("No videos in upload folder — nothing to do this run")
+        info("No videos in Mega.nz folder — nothing to do this run")
         return
 
     video_meta = videos[0]
-    file_id    = video_meta["id"]
-    file_name  = video_meta["name"]
-    ok(f"Selected video: {file_name} (id={file_id})")
+    file_name  = video_meta["Name"]
+    ok(f"Selected video: {file_name}")
 
     with tempfile.TemporaryDirectory() as tmp:
         try:
-            local_path = gdrive_download_video(service, file_id, file_name, tmp)
+            local_path = mega_download_video(mega_folder, file_name, tmp)
         except Exception as e:
             fail(f"Download failed: {e}")
             return
 
         try:
-            published = asyncio.run(upload_reel(caption=caption, video_path=local_path))
+            published = asyncio.run(upload_reel(
+                caption=caption,
+                video_path=local_path,
+                sheets_service=sheets_service,
+                spreadsheet_id=captions_sheet_id,
+            ))
         except Exception as e:
             fail(f"Upload exception: {e}")
             import traceback
@@ -1513,7 +1819,7 @@ def run_once():
 
     if published:
         try:
-            gdrive_move_to_uploaded(service, file_id, file_name, upload_folder, uploaded_folder)
+            mega_move_to_uploaded(mega_folder, mega_move_folder, file_name)
         except Exception as e:
             warn(f"Move to uploaded folder failed: {e}")
 
@@ -1522,9 +1828,10 @@ def run_once():
         # so the same caption (with fresh URL(s)) is used again next run.
         if new_urls and used_rows:
             sheet_mark_urls_status(sheets_service, captions_sheet_id, used_rows, status_col_idx, "Posted")
-        info("Caption left in sheet (not cleared) — will be reused next run with new URL(s)")
+        info(f"Caption left in sheet (not cleared) — will be reused next run "
+             f"({'with fresh URL(s)' if use_link_caption else 'no link'})")
     else:
-        warn("Upload not confirmed — file stays in upload folder for retry, "
+        warn("Upload not confirmed — video stays in the Mega.nz source folder for retry, "
              "caption left untouched and no URLs marked as Posted")
 
     print(f"\n{'='*60}")
