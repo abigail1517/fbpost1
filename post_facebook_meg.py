@@ -8,10 +8,9 @@ ALL runtime settings (Mega.nz folders, loop interval, max runtime, captions)
 are read from the Google Sheet at CAPTIONS_SHEET_ID / DEFAULT_CAPTIONS_SHEET_ID.
 Videos live on Mega.nz and are accessed via rclone (remote name "mega",
 configured by the GitHub Actions workflow from the RCLONE_CONF_MEGA secret).
-Nothing except the Google credentials (for Sheets only) and the rclone
-config come from the GitHub Actions workflow. The Facebook session now
-lives primarily in the Google Sheet itself (see FbStorageState below).
-See the SHEET HEADER COLUMNS section below.
+Nothing except the Facebook session, Google credentials (for Sheets only),
+and the rclone config come from the GitHub Actions workflow. See the SHEET
+HEADER COLUMNS section below.
 
 SHEET HEADER COLUMNS (row 1 = headers, exact names, case-insensitive):
   Caption               — the caption to post WHEN this run includes a
@@ -64,10 +63,20 @@ SHEET HEADER COLUMNS (row 1 = headers, exact names, case-insensitive):
                            Set to FALSE to skip URL swapping entirely and
                            post the 'Caption' exactly as written — the
                            'Urls' tab is not touched or read in that case.
+
+'Urls' TAB (same spreadsheet, separate tab named exactly "Urls"):
+  Urls                   — one URL per row.
+  Status                 — left blank for unused URLs. After a URL is used
+                           in a successful post, this script writes
+                           "Posted" into this column for that row so the
+                           URL is skipped on future runs (it is never
+                           deleted). Add this header yourself if it isn't
+                           already there.
+
   FbStorageState         — (on the main tab, row 2, alongside Caption
                            etc.) holds the Facebook session (Playwright
-                           storage_state JSON) as plain text. This is the
-                           PRIMARY source for the session — no more
+                           storage_state JSON) as plain text. This is now
+                           the PRIMARY source for the session — no more
                            relying on a GitHub secret that has to be
                            refreshed via the GitHub CLI. On every run,
                            after the browser closes, the script deletes
@@ -84,31 +93,28 @@ SHEET HEADER COLUMNS (row 1 = headers, exact names, case-insensitive):
                            once, and the script takes over refreshing it
                            from there.
 
-'Urls' TAB (same spreadsheet, separate tab named exactly "Urls"):
-  Urls                   — one URL per row.
-  Status                 — left blank for unused URLs. After a URL is used
-                           in a successful post, this script writes
-                           "Posted" into this column for that row so the
-                           URL is skipped on future runs (it is never
-                           deleted). Add this header yourself if it isn't
-                           already there.
-
 ─────────────────────────────────────────
 CHANGELOG (this version)
 ─────────────────────────────────────────
-- Caption entry is the ORIGINAL blob-based method (clipboard paste /
-  execCommand insertText / InputEvent dispatch / keyboard.type — each
-  inserting the whole caption, including its embedded "\n" characters,
-  in a single call). Verified with the original loose "did some text
-  land" check (no line-count comparison).
-- All waits and clicks throughout the flow are plain, fixed-delay,
-  direct-click calls — no randomized jitter, no simulated mouse movement,
-  no character-by-character typing. (A randomized/human-paced version was
-  tried and reverted at the user's request — kept things simple instead.)
-- Facebook session (storage_state) is read from / written back to a
-  'FbStorageState' column in the Google Sheet on every run, so it no
-  longer depends on refreshing a GitHub Actions secret. FB_STORAGE_STATE
-  env var and local storage_state.json remain as fallbacks.
+- Caption entry now types line-by-line with an explicit Enter keypress
+  between lines instead of relying on embedded "\n" characters inside a
+  single insertText/InputEvent/keyboard.type call. Facebook's Lexical
+  editor does not reliably turn a literal "\n" inside a pasted/inserted
+  string into a new paragraph node — it wants an actual Enter keypress
+  (or a real clipboard paste with proper HTML/line data) to create a new
+  line. This was the root cause of captions arriving "squished" (all
+  lines and hashtags running together) even though the script logged a
+  successful caption entry.
+- The browser context now explicitly grants clipboard-read/clipboard-write
+  permissions so the clipboard-paste strategy actually has a chance to
+  work in headless Chromium (previously navigator.clipboard.writeText()
+  could fail silently there, silently degrading to a worse strategy).
+- Success verification for caption entry no longer just checks "some text
+  landed" — it now compares the number of non-empty lines typed into the
+  field against the number of non-empty lines in the intended caption.
+  A strategy that squishes everything onto one line now correctly fails
+  verification and the script falls through to try the next strategy,
+  instead of silently reporting success on mangled output.
 """
 
 import asyncio, json, os, random, re, subprocess, sys, tempfile, time
@@ -1004,12 +1010,31 @@ async def ensure_logged_in(page) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Caption entry — handles Lexical editor with 4 fallback strategies
-# (original blob-based method)
+# Caption entry — handles Lexical editor with line-aware fallback strategies
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _nonempty_lines(text: str) -> list[str]:
+    return [l for l in text.split("\n") if l.strip()]
+
+
+async def _clear_field(page, field):
+    await field.click(timeout=5_000)
+    await asyncio.sleep(0.3)
+    await page.keyboard.press("Control+a")
+    await asyncio.sleep(0.2)
+    await page.keyboard.press("Backspace")
+    await asyncio.sleep(0.2)
+
+
 async def enter_caption_lexical(page, caption: str) -> bool:
-    """Try 4 strategies to paste text into Facebook's Lexical editor."""
+    """
+    Try several strategies to get `caption` into Facebook's Lexical
+    editor, in order of fidelity. Each strategy is verified by comparing
+    the number of non-empty lines that actually landed in the field
+    against the number of non-empty lines in the intended caption — not
+    just "some text is present" — since a squished, single-line result
+    still contains all the characters but is not a correct caption.
+    """
     LEXICAL_SELECTORS = [
         'div[data-lexical-editor="true"][contenteditable="true"]',
         'div[contenteditable="true"][aria-placeholder="Describe your reel..."]',
@@ -1017,14 +1042,31 @@ async def enter_caption_lexical(page, caption: str) -> bool:
         'div[contenteditable="true"]',
     ]
 
+    expected_lines = len(_nonempty_lines(caption))
+
+    async def strategy_keyboard_type_lines(field):
+        # PRIMARY strategy: type each line separately and press a real
+        # Enter key between lines. This is what reliably creates new
+        # paragraph nodes in Lexical — embedding "\n" inside a single
+        # insertText/InputEvent/keyboard.type call does not.
+        info("Strategy 1: keyboard.type line-by-line with explicit Enter")
+        await _clear_field(page, field)
+        lines = caption.split("\n")
+        for i, line in enumerate(lines):
+            if line:
+                await page.keyboard.type(line, delay=12)
+            if i < len(lines) - 1:
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(0.05)
+        await asyncio.sleep(0.5)
+
     async def strategy_clipboard(field):
-        info("Strategy 1: clipboard paste via Ctrl+V")
-        await field.click(timeout=5_000)
-        await asyncio.sleep(0.4)
-        await page.keyboard.press("Control+a")
-        await asyncio.sleep(0.2)
-        await page.keyboard.press("Backspace")
-        await asyncio.sleep(0.2)
+        # Real clipboard paste — Lexical's paste handler understands
+        # line breaks correctly when the clipboard actually contains
+        # text with real newlines. Requires clipboard-write/read
+        # permissions to be granted on the browser context.
+        info("Strategy 2: clipboard paste via Ctrl+V")
+        await _clear_field(page, field)
         await page.evaluate(
             "(text) => navigator.clipboard.writeText(text).catch(() => {})",
             caption,
@@ -1033,67 +1075,72 @@ async def enter_caption_lexical(page, caption: str) -> bool:
         await page.keyboard.press("Control+v")
         await asyncio.sleep(0.8)
 
-    async def strategy_exec_command(field):
-        info("Strategy 2: execCommand insertText")
-        await field.click(timeout=5_000)
-        await asyncio.sleep(0.3)
-        await page.evaluate(
-            """(el, text) => {
-                el.focus();
-                document.execCommand('selectAll', false, null);
-                document.execCommand('delete', false, null);
-                document.execCommand('insertText', false, text);
-            }""",
-            [field, caption],
-        )
+    async def strategy_exec_command_per_line(field):
+        # execCommand insertText per line + insertParagraph between
+        # lines, rather than a single blob containing "\n".
+        info("Strategy 3: execCommand insertText per line")
+        await _clear_field(page, field)
+        lines = caption.split("\n")
+        for i, line in enumerate(lines):
+            if line:
+                await page.evaluate(
+                    """(el, text) => {
+                        el.focus();
+                        document.execCommand('insertText', false, text);
+                    }""",
+                    [field, line],
+                )
+            if i < len(lines) - 1:
+                await page.evaluate(
+                    """(el) => {
+                        el.focus();
+                        document.execCommand('insertParagraph', false, null);
+                    }""",
+                    field,
+                )
+            await asyncio.sleep(0.05)
         await asyncio.sleep(0.5)
 
-    async def strategy_input_event(field):
-        info("Strategy 3: InputEvent dispatch")
-        await field.click(timeout=5_000)
-        await asyncio.sleep(0.3)
-        await page.evaluate(
-            """(el, text) => {
-                el.focus();
-                const sel = window.getSelection();
-                const range = document.createRange();
-                range.selectNodeContents(el);
-                sel.removeAllRanges();
-                sel.addRange(range);
-                const ev = new InputEvent('beforeinput', {
-                    inputType: 'insertText',
-                    data: text,
-                    bubbles: true,
-                    cancelable: true,
-                });
-                el.dispatchEvent(ev);
-                const ev2 = new InputEvent('input', {
-                    inputType: 'insertText',
-                    data: text,
-                    bubbles: true,
-                });
-                el.dispatchEvent(ev2);
-            }""",
-            [field, caption],
-        )
-        await asyncio.sleep(0.5)
-
-    async def strategy_keyboard_type(field):
-        info("Strategy 4: keyboard.type fallback")
-        await field.click(timeout=5_000)
-        await asyncio.sleep(0.3)
-        await page.keyboard.press("Control+a")
-        await asyncio.sleep(0.2)
-        await page.keyboard.press("Backspace")
-        await asyncio.sleep(0.2)
-        await page.keyboard.type(caption, delay=20)
+    async def strategy_input_event_per_line(field):
+        # InputEvent dispatch per line, with a separate Enter keypress
+        # (real KeyboardEvent, not just an inserted character) between
+        # lines so Lexical's key handler creates a new block.
+        info("Strategy 4: InputEvent dispatch per line + Enter keypress")
+        await _clear_field(page, field)
+        lines = caption.split("\n")
+        for i, line in enumerate(lines):
+            if line:
+                await page.evaluate(
+                    """(el, text) => {
+                        el.focus();
+                        const sel = window.getSelection();
+                        const range = document.createRange();
+                        range.selectNodeContents(el);
+                        range.collapse(false);
+                        sel.removeAllRanges();
+                        sel.addRange(range);
+                        const ev = new InputEvent('beforeinput', {
+                            inputType: 'insertText', data: text,
+                            bubbles: true, cancelable: true,
+                        });
+                        el.dispatchEvent(ev);
+                        const ev2 = new InputEvent('input', {
+                            inputType: 'insertText', data: text, bubbles: true,
+                        });
+                        el.dispatchEvent(ev2);
+                    }""",
+                    [field, line],
+                )
+            if i < len(lines) - 1:
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(0.05)
         await asyncio.sleep(0.5)
 
     strategies = [
+        strategy_keyboard_type_lines,
         strategy_clipboard,
-        strategy_exec_command,
-        strategy_input_event,
-        strategy_keyboard_type,
+        strategy_exec_command_per_line,
+        strategy_input_event_per_line,
     ]
 
     for i, strategy in enumerate(strategies, 1):
@@ -1106,9 +1153,15 @@ async def enter_caption_lexical(page, caption: str) -> bool:
                 txt = await field.evaluate(
                     "el => (el.innerText || el.textContent || '').trim()"
                 )
-                if txt and len(txt) > 2:
-                    ok(f"Caption entered via strategy {i} / selector '{sel}' ({len(txt)} chars)")
+                actual_lines = len(_nonempty_lines(txt))
+                if txt and len(txt) > 2 and abs(actual_lines - expected_lines) <= 1:
+                    ok(f"Caption entered via strategy {i} / selector '{sel}' "
+                       f"({len(txt)} chars, {actual_lines}/{expected_lines} lines matched)")
                     return True
+                elif txt and len(txt) > 2:
+                    warn(f"Strategy {i} / '{sel}': text landed but line count "
+                         f"mismatch ({actual_lines} vs expected {expected_lines}) "
+                         f"— likely squished, trying next strategy")
                 else:
                     warn(f"Strategy {i} / '{sel}': field empty after attempt")
             except Exception as e:
@@ -1438,12 +1491,15 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
 
     # ── Step 6: Enter caption ─────────────────────────────────────────────
     step("Entering caption text")
-    info(f"Caption to type ({len(caption)} chars): {caption[:80]}")
+    info(f"Caption to type ({len(caption)} chars, "
+         f"{len(_nonempty_lines(caption))} non-empty lines): {caption[:80]}")
 
     caption_ok = await enter_caption_lexical(page, caption)
 
     if not caption_ok:
-        warn("Caption could not be entered — continuing anyway (post may have no caption)")
+        warn("Caption could not be entered with correct line breaks after all "
+             "strategies — continuing anyway (post may have a squished or "
+             "missing caption; check 06_after_caption.png)")
     await save_screenshot(page, "06_after_caption")
 
     # ── Step 7: Advance to Post panel if needed ───────────────────────────
