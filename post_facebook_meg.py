@@ -8,9 +8,10 @@ ALL runtime settings (Mega.nz folders, loop interval, max runtime, captions)
 are read from the Google Sheet at CAPTIONS_SHEET_ID / DEFAULT_CAPTIONS_SHEET_ID.
 Videos live on Mega.nz and are accessed via rclone (remote name "mega",
 configured by the GitHub Actions workflow from the RCLONE_CONF_MEGA secret).
-Nothing except the Facebook session, Google credentials (for Sheets only),
-and the rclone config come from the GitHub Actions workflow. See the SHEET
-HEADER COLUMNS section below.
+Nothing except the Google credentials (for Sheets only) and the rclone
+config come from the GitHub Actions workflow. The Facebook session now
+lives primarily in the Google Sheet itself (see FbStorageState below).
+See the SHEET HEADER COLUMNS section below.
 
 SHEET HEADER COLUMNS (row 1 = headers, exact names, case-insensitive):
   Caption               — the caption to post WHEN this run includes a
@@ -63,20 +64,10 @@ SHEET HEADER COLUMNS (row 1 = headers, exact names, case-insensitive):
                            Set to FALSE to skip URL swapping entirely and
                            post the 'Caption' exactly as written — the
                            'Urls' tab is not touched or read in that case.
-
-'Urls' TAB (same spreadsheet, separate tab named exactly "Urls"):
-  Urls                   — one URL per row.
-  Status                 — left blank for unused URLs. After a URL is used
-                           in a successful post, this script writes
-                           "Posted" into this column for that row so the
-                           URL is skipped on future runs (it is never
-                           deleted). Add this header yourself if it isn't
-                           already there.
-
   FbStorageState         — (on the main tab, row 2, alongside Caption
                            etc.) holds the Facebook session (Playwright
-                           storage_state JSON) as plain text. This is now
-                           the PRIMARY source for the session — no more
+                           storage_state JSON) as plain text. This is the
+                           PRIMARY source for the session — no more
                            relying on a GitHub secret that has to be
                            refreshed via the GitHub CLI. On every run,
                            after the browser closes, the script deletes
@@ -93,28 +84,36 @@ SHEET HEADER COLUMNS (row 1 = headers, exact names, case-insensitive):
                            once, and the script takes over refreshing it
                            from there.
 
+'Urls' TAB (same spreadsheet, separate tab named exactly "Urls"):
+  Urls                   — one URL per row.
+  Status                 — left blank for unused URLs. After a URL is used
+                           in a successful post, this script writes
+                           "Posted" into this column for that row so the
+                           URL is skipped on future runs (it is never
+                           deleted). Add this header yourself if it isn't
+                           already there.
+
 ─────────────────────────────────────────
 CHANGELOG (this version)
 ─────────────────────────────────────────
-- Caption entry now types line-by-line with an explicit Enter keypress
-  between lines instead of relying on embedded "\n" characters inside a
-  single insertText/InputEvent/keyboard.type call. Facebook's Lexical
-  editor does not reliably turn a literal "\n" inside a pasted/inserted
-  string into a new paragraph node — it wants an actual Enter keypress
-  (or a real clipboard paste with proper HTML/line data) to create a new
-  line. This was the root cause of captions arriving "squished" (all
-  lines and hashtags running together) even though the script logged a
-  successful caption entry.
-- The browser context now explicitly grants clipboard-read/clipboard-write
-  permissions so the clipboard-paste strategy actually has a chance to
-  work in headless Chromium (previously navigator.clipboard.writeText()
-  could fail silently there, silently degrading to a worse strategy).
-- Success verification for caption entry no longer just checks "some text
-  landed" — it now compares the number of non-empty lines typed into the
-  field against the number of non-empty lines in the intended caption.
-  A strategy that squishes everything onto one line now correctly fails
-  verification and the script falls through to try the next strategy,
-  instead of silently reporting success on mangled output.
+- Caption entry reverted to the ORIGINAL blob-based method (clipboard
+  paste / execCommand insertText / InputEvent dispatch / keyboard.type —
+  each inserting the whole caption, including its embedded "\n"
+  characters, in a single call rather than typing line-by-line with
+  scripted Enter keypresses). A brief experiment typed captions line by
+  line with an explicit Enter press between lines to force correct line
+  breaks in Facebook's Lexical editor — that fixed the squished-caption
+  formatting issue, but the very regular, mechanically-timed sequence of
+  keypress events reads as automated and got flagged by Facebook. The
+  blob-paste/type approach mimics a real paste or fast type event and is
+  the natural-looking method, so it's back to being the only method used
+  here. Caption formatting on the FB side may occasionally still collapse
+  some line breaks depending on which fallback strategy ends up firing —
+  that tradeoff is intentional now in favor of not being detected.
+- Facebook session (storage_state) is now read from / written back to a
+  'FbStorageState' column in the Google Sheet on every run, so it no
+  longer depends on refreshing a GitHub Actions secret. FB_STORAGE_STATE
+  env var and local storage_state.json remain as fallbacks.
 """
 
 import asyncio, json, os, random, re, subprocess, sys, tempfile, time
@@ -209,6 +208,86 @@ def ok(msg):     print(f"   ✅ {msg}")
 def warn(msg):   print(f"   ⚠️  {msg}")
 def fail(msg):   print(f"   ❌ {msg}")
 def debug(msg):  print(f"   🔍 {msg}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Human-like timing / interaction helpers
+# ─────────────────────────────────────────────────────────────────────────────
+# Real people don't pause for exactly N seconds, move the mouse straight to
+# a target in a dead-straight line, or type at a perfectly constant rate.
+# These helpers add randomized jitter to waits, mouse movement, and typing
+# so the automation's timing/motion signature doesn't look scripted. They
+# are cosmetic-only — if anything here throws, we swallow it and fall back
+# to the raw action rather than ever blocking the real interaction on it.
+
+async def human_pause(min_s: float, max_s: float):
+    """Sleep for a random duration in [min_s, max_s] seconds."""
+    await asyncio.sleep(random.uniform(min_s, max_s))
+
+
+async def human_move_before_click(page, locator):
+    """
+    Nudges the mouse toward the target element in 1-3 small randomized
+    steps before clicking, instead of jumping the cursor straight there.
+    """
+    try:
+        box = await locator.bounding_box()
+        if not box:
+            return
+        target_x = box["x"] + box["width"] * random.uniform(0.35, 0.65)
+        target_y = box["y"] + box["height"] * random.uniform(0.35, 0.65)
+        steps = random.randint(1, 3)
+        for _ in range(steps):
+            jitter_x = target_x + random.uniform(-18, 18)
+            jitter_y = target_y + random.uniform(-12, 12)
+            await page.mouse.move(jitter_x, jitter_y, steps=random.randint(3, 9))
+            await human_pause(0.03, 0.13)
+        await page.mouse.move(target_x, target_y, steps=random.randint(3, 7))
+        await human_pause(0.05, 0.22)
+    except Exception:
+        pass
+
+
+async def human_click(page, locator, **kwargs):
+    """Moves the mouse naturally toward the element, pauses, then clicks."""
+    await human_move_before_click(page, locator)
+    await human_pause(0.05, 0.28)
+    await locator.click(**kwargs)
+
+
+async def human_type(page, text: str,
+                      min_char_delay: float = 0.035, max_char_delay: float = 0.16,
+                      pause_chance: float = 0.035, pause_min: float = 0.25, pause_max: float = 1.1,
+                      word_pause_chance: float = 0.12, word_pause_min: float = 0.08,
+                      word_pause_max: float = 0.3):
+    """
+    Types `text` one character at a time with a randomized per-character
+    delay, an occasional longer 'thinking' pause, and a slightly higher
+    chance of a brief pause right after a space (word boundary) — closer
+    to how a person actually types than one call with a constant delay.
+    """
+    for ch in text:
+        await page.keyboard.type(ch, delay=0)
+        await asyncio.sleep(random.uniform(min_char_delay, max_char_delay))
+        if ch == " " and random.random() < word_pause_chance:
+            await asyncio.sleep(random.uniform(word_pause_min, word_pause_max))
+        elif random.random() < pause_chance:
+            await asyncio.sleep(random.uniform(pause_min, pause_max))
+
+
+def jitter(base_seconds: float, spread: float = 0.35) -> float:
+    """
+    Returns a randomized value around `base_seconds`, +/- `spread` fraction
+    (e.g. jitter(8, 0.35) → somewhere around 5.2s-10.8s). Used to replace
+    fixed asyncio.sleep(N) waits with a value that varies run to run.
+    """
+    low = base_seconds * (1 - spread)
+    high = base_seconds * (1 + spread)
+    return random.uniform(max(low, 0.1), high)
+
+
+async def human_wait(base_seconds: float, spread: float = 0.35):
+    """asyncio.sleep(jitter(base_seconds, spread)) in one call."""
+    await asyncio.sleep(jitter(base_seconds, spread))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Google credentials / Sheets service (Sheets only — no Drive)
@@ -900,7 +979,7 @@ async def nuke_continue_button(page, label: str) -> bool:
                 pass
         if found_sel:
             break
-        await asyncio.sleep(1)
+        await human_wait(1, 0.4)
 
     if not found_sel:
         warn("No Continue button found in DOM after 10s")
@@ -919,7 +998,7 @@ async def nuke_continue_button(page, label: str) -> bool:
             }""")
             if hit:
                 ok(f"JS found & clicked Continue: {hit[:80]}")
-                await asyncio.sleep(5)
+                await human_wait(5, 0.3)
                 return page.url != url_before
         except Exception as e:
             warn(f"JS search failed: {e}")
@@ -928,7 +1007,7 @@ async def nuke_continue_button(page, label: str) -> bool:
         try:
             await page.goto("https://www.facebook.com/?sk=h_chr",
                             wait_until="domcontentloaded", timeout=30_000)
-            await asyncio.sleep(5)
+            await human_wait(5, 0.3)
             if not is_picker_url(page.url) and not is_hard_login_url(page.url):
                 ok(f"Direct nav bypassed picker → {page.url}")
                 return True
@@ -945,7 +1024,7 @@ async def nuke_continue_button(page, label: str) -> bool:
     ]:
         try:
             await method()
-            await asyncio.sleep(5)
+            await human_wait(5, 0.3)
             if page.url != url_before:
                 ok(f"Continue clicked via {method_name} — URL changed")
                 return True
@@ -982,7 +1061,7 @@ async def ensure_logged_in(page) -> bool:
             await save_screenshot(page, f"after_continue_{attempt+1}")
             if not ok_click:
                 warn(f"Could not click Continue on attempt {attempt+1}")
-                await asyncio.sleep(3)
+                await human_wait(3, 0.4)
             continue
 
         for sel in FEED_SELECTORS:
@@ -1000,8 +1079,8 @@ async def ensure_logged_in(page) -> bool:
         except Exception:
             pass
 
-        info(f"Feed not ready yet — waiting 4s (attempt {attempt+1}/6)")
-        await asyncio.sleep(4)
+        info(f"Feed not ready yet — waiting ~4s (attempt {attempt+1}/6)")
+        await human_wait(4, 0.35)
 
     fail("Login check exhausted all 6 attempts")
     await dump_html(page, "login_failed_final.html")
@@ -1010,31 +1089,14 @@ async def ensure_logged_in(page) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Caption entry — handles Lexical editor with line-aware fallback strategies
+# Caption entry — handles Lexical editor with 4 fallback strategies
+# (ORIGINAL blob-based method — restored because the line-by-line typing
+#  variant, while it fixed line-break formatting, was detectable by
+#  Facebook. This is the natural-looking paste/type method.)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _nonempty_lines(text: str) -> list[str]:
-    return [l for l in text.split("\n") if l.strip()]
-
-
-async def _clear_field(page, field):
-    await field.click(timeout=5_000)
-    await asyncio.sleep(0.3)
-    await page.keyboard.press("Control+a")
-    await asyncio.sleep(0.2)
-    await page.keyboard.press("Backspace")
-    await asyncio.sleep(0.2)
-
-
 async def enter_caption_lexical(page, caption: str) -> bool:
-    """
-    Try several strategies to get `caption` into Facebook's Lexical
-    editor, in order of fidelity. Each strategy is verified by comparing
-    the number of non-empty lines that actually landed in the field
-    against the number of non-empty lines in the intended caption — not
-    just "some text is present" — since a squished, single-line result
-    still contains all the characters but is not a correct caption.
-    """
+    """Try 4 strategies to paste text into Facebook's Lexical editor."""
     LEXICAL_SELECTORS = [
         'div[data-lexical-editor="true"][contenteditable="true"]',
         'div[contenteditable="true"][aria-placeholder="Describe your reel..."]',
@@ -1042,105 +1104,85 @@ async def enter_caption_lexical(page, caption: str) -> bool:
         'div[contenteditable="true"]',
     ]
 
-    expected_lines = len(_nonempty_lines(caption))
-
-    async def strategy_keyboard_type_lines(field):
-        # PRIMARY strategy: type each line separately and press a real
-        # Enter key between lines. This is what reliably creates new
-        # paragraph nodes in Lexical — embedding "\n" inside a single
-        # insertText/InputEvent/keyboard.type call does not.
-        info("Strategy 1: keyboard.type line-by-line with explicit Enter")
-        await _clear_field(page, field)
-        lines = caption.split("\n")
-        for i, line in enumerate(lines):
-            if line:
-                await page.keyboard.type(line, delay=12)
-            if i < len(lines) - 1:
-                await page.keyboard.press("Enter")
-                await asyncio.sleep(0.05)
-        await asyncio.sleep(0.5)
-
     async def strategy_clipboard(field):
-        # Real clipboard paste — Lexical's paste handler understands
-        # line breaks correctly when the clipboard actually contains
-        # text with real newlines. Requires clipboard-write/read
-        # permissions to be granted on the browser context.
-        info("Strategy 2: clipboard paste via Ctrl+V")
-        await _clear_field(page, field)
+        info("Strategy 1: clipboard paste via Ctrl+V (human-paced)")
+        await human_click(page, field, timeout=5_000)
+        await human_pause(0.25, 0.7)
+        await page.keyboard.press("Control+a")
+        await human_pause(0.1, 0.35)
+        await page.keyboard.press("Backspace")
+        await human_pause(0.15, 0.5)
         await page.evaluate(
             "(text) => navigator.clipboard.writeText(text).catch(() => {})",
             caption,
         )
-        await asyncio.sleep(0.3)
+        await human_pause(0.2, 0.65)
         await page.keyboard.press("Control+v")
-        await asyncio.sleep(0.8)
+        await human_pause(0.5, 1.4)
 
-    async def strategy_exec_command_per_line(field):
-        # execCommand insertText per line + insertParagraph between
-        # lines, rather than a single blob containing "\n".
-        info("Strategy 3: execCommand insertText per line")
-        await _clear_field(page, field)
-        lines = caption.split("\n")
-        for i, line in enumerate(lines):
-            if line:
-                await page.evaluate(
-                    """(el, text) => {
-                        el.focus();
-                        document.execCommand('insertText', false, text);
-                    }""",
-                    [field, line],
-                )
-            if i < len(lines) - 1:
-                await page.evaluate(
-                    """(el) => {
-                        el.focus();
-                        document.execCommand('insertParagraph', false, null);
-                    }""",
-                    field,
-                )
-            await asyncio.sleep(0.05)
-        await asyncio.sleep(0.5)
+    async def strategy_exec_command(field):
+        info("Strategy 2: execCommand insertText (human-paced)")
+        await human_click(page, field, timeout=5_000)
+        await human_pause(0.2, 0.55)
+        await page.evaluate(
+            """(el, text) => {
+                el.focus();
+                document.execCommand('selectAll', false, null);
+                document.execCommand('delete', false, null);
+                document.execCommand('insertText', false, text);
+            }""",
+            [field, caption],
+        )
+        await human_pause(0.35, 0.9)
 
-    async def strategy_input_event_per_line(field):
-        # InputEvent dispatch per line, with a separate Enter keypress
-        # (real KeyboardEvent, not just an inserted character) between
-        # lines so Lexical's key handler creates a new block.
-        info("Strategy 4: InputEvent dispatch per line + Enter keypress")
-        await _clear_field(page, field)
-        lines = caption.split("\n")
-        for i, line in enumerate(lines):
-            if line:
-                await page.evaluate(
-                    """(el, text) => {
-                        el.focus();
-                        const sel = window.getSelection();
-                        const range = document.createRange();
-                        range.selectNodeContents(el);
-                        range.collapse(false);
-                        sel.removeAllRanges();
-                        sel.addRange(range);
-                        const ev = new InputEvent('beforeinput', {
-                            inputType: 'insertText', data: text,
-                            bubbles: true, cancelable: true,
-                        });
-                        el.dispatchEvent(ev);
-                        const ev2 = new InputEvent('input', {
-                            inputType: 'insertText', data: text, bubbles: true,
-                        });
-                        el.dispatchEvent(ev2);
-                    }""",
-                    [field, line],
-                )
-            if i < len(lines) - 1:
-                await page.keyboard.press("Enter")
-                await asyncio.sleep(0.05)
-        await asyncio.sleep(0.5)
+    async def strategy_input_event(field):
+        info("Strategy 3: InputEvent dispatch (human-paced)")
+        await human_click(page, field, timeout=5_000)
+        await human_pause(0.2, 0.55)
+        await page.evaluate(
+            """(el, text) => {
+                el.focus();
+                const sel = window.getSelection();
+                const range = document.createRange();
+                range.selectNodeContents(el);
+                sel.removeAllRanges();
+                sel.addRange(range);
+                const ev = new InputEvent('beforeinput', {
+                    inputType: 'insertText',
+                    data: text,
+                    bubbles: true,
+                    cancelable: true,
+                });
+                el.dispatchEvent(ev);
+                const ev2 = new InputEvent('input', {
+                    inputType: 'insertText',
+                    data: text,
+                    bubbles: true,
+                });
+                el.dispatchEvent(ev2);
+            }""",
+            [field, caption],
+        )
+        await human_pause(0.35, 0.9)
+
+    async def strategy_keyboard_type(field):
+        # Character-by-character with randomized per-key delay, occasional
+        # "thinking" pauses, and word-boundary pauses — see human_type().
+        info("Strategy 4: keyboard.type fallback (human-paced, char-by-char)")
+        await human_click(page, field, timeout=5_000)
+        await human_pause(0.2, 0.5)
+        await page.keyboard.press("Control+a")
+        await human_pause(0.1, 0.3)
+        await page.keyboard.press("Backspace")
+        await human_pause(0.15, 0.45)
+        await human_type(page, caption)
+        await human_pause(0.3, 0.85)
 
     strategies = [
-        strategy_keyboard_type_lines,
         strategy_clipboard,
-        strategy_exec_command_per_line,
-        strategy_input_event_per_line,
+        strategy_exec_command,
+        strategy_input_event,
+        strategy_keyboard_type,
     ]
 
     for i, strategy in enumerate(strategies, 1):
@@ -1153,15 +1195,9 @@ async def enter_caption_lexical(page, caption: str) -> bool:
                 txt = await field.evaluate(
                     "el => (el.innerText || el.textContent || '').trim()"
                 )
-                actual_lines = len(_nonempty_lines(txt))
-                if txt and len(txt) > 2 and abs(actual_lines - expected_lines) <= 1:
-                    ok(f"Caption entered via strategy {i} / selector '{sel}' "
-                       f"({len(txt)} chars, {actual_lines}/{expected_lines} lines matched)")
+                if txt and len(txt) > 2:
+                    ok(f"Caption entered via strategy {i} / selector '{sel}' ({len(txt)} chars)")
                     return True
-                elif txt and len(txt) > 2:
-                    warn(f"Strategy {i} / '{sel}': text landed but line count "
-                         f"mismatch ({actual_lines} vs expected {expected_lines}) "
-                         f"— likely squished, trying next strategy")
                 else:
                     warn(f"Strategy {i} / '{sel}': field empty after attempt")
             except Exception as e:
@@ -1289,7 +1325,7 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
         await save_screenshot(page, "FAIL_01_load")
         return False
 
-    await asyncio.sleep(8)
+    await human_wait(8)
     info(f"Current URL after load: {page.url}")
     info(f"URL type: {classify_url(page.url)}")
     await save_screenshot(page, "01_after_load")
@@ -1312,7 +1348,7 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
         await save_screenshot(page, "FAIL_03_nav")
         return False
 
-    await asyncio.sleep(8)
+    await human_wait(8)
     info(f"Current URL: {page.url}")
     info(f"URL type: {classify_url(page.url)}")
     await save_screenshot(page, "03_reels_create")
@@ -1331,6 +1367,7 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
             count = await inp.count()
             info(f"File input selector '{sel}': {count} found")
             if count > 0:
+                await human_pause(0.4, 1.1)
                 await inp.first.set_input_files(video_path)
                 ok(f"Video attached via direct input: {sel}")
                 uploaded = True
@@ -1356,6 +1393,7 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
                 info(f"Upload button '{btn_name}': {count} found")
                 if count == 0:
                     continue
+                await human_move_before_click(page, el)
                 async with page.expect_file_chooser(timeout=10_000) as fc_info:
                     await el.click(force=True)
                 fc = await fc_info.value
@@ -1403,7 +1441,7 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
             break
         if elapsed % 15 == 0:
             await save_screenshot(page, f"04_processing_{elapsed}s")
-        await asyncio.sleep(5)
+        await human_wait(5, 0.3)
 
     if not next_ready:
         warn("Next button never became active after 3 minutes")
@@ -1442,7 +1480,8 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
                 if disabled == "true":
                     continue
                 await btn.scroll_into_view_if_needed(timeout=5_000)
-                await btn.click(timeout=10_000)
+                await human_pause(0.15, 0.5)
+                await human_click(page, btn, timeout=10_000)
                 ok(f"Next clicked via: {sel}")
                 return True
             except Exception as e:
@@ -1475,7 +1514,7 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
                 ok(f"Caption field appeared {elapsed}s after Next click {next_attempt}")
                 caption_field_found = True
                 break
-            await asyncio.sleep(2)
+            await human_wait(2, 0.4)
 
         if caption_field_found:
             break
@@ -1491,15 +1530,12 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
 
     # ── Step 6: Enter caption ─────────────────────────────────────────────
     step("Entering caption text")
-    info(f"Caption to type ({len(caption)} chars, "
-         f"{len(_nonempty_lines(caption))} non-empty lines): {caption[:80]}")
+    info(f"Caption to type ({len(caption)} chars): {caption[:80]}")
 
     caption_ok = await enter_caption_lexical(page, caption)
 
     if not caption_ok:
-        warn("Caption could not be entered with correct line breaks after all "
-             "strategies — continuing anyway (post may have a squished or "
-             "missing caption; check 06_after_caption.png)")
+        warn("Caption could not be entered — continuing anyway (post may have no caption)")
     await save_screenshot(page, "06_after_caption")
 
     # ── Step 7: Advance to Post panel if needed ───────────────────────────
@@ -1546,10 +1582,11 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
                 label_text = await btn.inner_text()
                 info(f"Found button '{sel}' with text: {label_text!r}")
                 await btn.scroll_into_view_if_needed(timeout=5_000)
-                await btn.click(force=True)
+                await human_pause(0.15, 0.5)
+                await human_click(page, btn, force=True)
                 ok(f"Clicked '{label_text.strip()}' via: {sel}")
                 clicked_next2 = True
-                await asyncio.sleep(4)
+                await human_wait(4, 0.35)
                 break
             except Exception as e:
                 warn(f"Button '{sel}' failed: {e}")
@@ -1591,7 +1628,7 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
         if post_btn_found:
             break
         info(f"Waiting for Post button... {wait_elapsed}s")
-        await asyncio.sleep(2)
+        await human_wait(2, 0.4)
 
     if not post_btn_found:
         warn("Post button not yet visible — attempting click anyway")
@@ -1609,10 +1646,11 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
                 warn(f"  '{sel_name}' is disabled — skipping")
                 continue
             await btn.scroll_into_view_if_needed(timeout=5_000)
-            await btn.click(force=True)
+            await human_pause(0.2, 0.6)
+            await human_click(page, btn, force=True)
             ok(f"Post button clicked via: {sel_name}")
             post_clicked = True
-            await asyncio.sleep(5)
+            await human_wait(5, 0.3)
             break
         except Exception as e:
             warn(f"Post '{sel_name}' failed: {e}")
@@ -1649,7 +1687,7 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
         info(f"Waiting for confirmation... {elapsed}s")
         if elapsed % 15 == 0:
             await save_screenshot(page, f"09_waiting_confirm_{elapsed}s")
-        await asyncio.sleep(5)
+        await human_wait(5, 0.3)
 
     if not published:
         info("No explicit confirmation — checking page state...")
