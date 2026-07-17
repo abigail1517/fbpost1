@@ -66,8 +66,12 @@ jobs:
           echo "📁 Workspace contents:"
           ls -lh
           echo ""
-          echo "Checking required secrets…"
-          for VAR_NAME in FB_STORAGE_STATE GOOGLE_CREDENTIALS_JSON RCLONE_CONF_MEGA; do
+          echo "Checking secrets…"
+          echo "ℹ️  FB_STORAGE_STATE is now OPTIONAL — it's only used as a one-time"
+          echo "   seed if the 'FbStorageState' cell in the Google Sheet is empty."
+          echo "   Once seeded, the script refreshes the session in the sheet itself"
+          echo "   after every run, so this secret can be left unset going forward."
+          for VAR_NAME in GOOGLE_CREDENTIALS_JSON RCLONE_CONF_MEGA; do
             VAL="${!VAR_NAME}"
             if [ -n "$VAL" ]; then
               echo "✅ $VAR_NAME is set"
@@ -75,9 +79,16 @@ jobs:
               echo "❌ $VAR_NAME is MISSING"
             fi
           done
+          if [ -n "$FB_STORAGE_STATE" ]; then
+            echo "✅ FB_STORAGE_STATE is set (optional seed)"
+          else
+            echo "ℹ️  FB_STORAGE_STATE is not set — fine as long as the sheet's "
+            echo "   'FbStorageState' cell already has a session in it"
+          fi
           echo "📝 Captions/settings sheet: ${{ inputs.captions_sheet_id }}"
           echo "ℹ️  Mega.nz source folder, move folder, loop interval, max runtime,"
-          echo "   and URL-replace settings are all read from that sheet's row 2 at runtime."
+          echo "   URL-replace settings, and the Facebook session are all read from"
+          echo "   that sheet's row 2 at runtime."
           echo "   Default Mega.nz source folder if left blank: fbreels"
 
       # ── 6. Run the loop ──────────────────────────────────────────────────
@@ -87,6 +98,11 @@ jobs:
       # The "Self-requeue" step below then triggers a fresh workflow run
       # so posting continues without interruption.
       #
+      # The Facebook session (storage_state) is read from the sheet's
+      # 'FbStorageState' cell and refreshed back into that same cell after
+      # every run — FB_STORAGE_STATE here is only a fallback seed for the
+      # very first run, before the sheet has ever been populated.
+      #
       - name: Run upload loop
         env:
           TZ:                      "Asia/Karachi"
@@ -95,24 +111,10 @@ jobs:
           CAPTIONS_SHEET_ID:       ${{ inputs.captions_sheet_id }}
         run: |
           echo "🔁 Starting loop — timing is controlled by the Google Sheet"
-          python post_facebook_meg.py
+          python post_facebook.py
           echo "⏹️  Loop window finished"
 
-      # ── 7. Refresh FB session secret ─────────────────────────────────────
-      - name: Refresh FB_STORAGE_STATE secret
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-        run: |
-          if [ -f "storage_state.json" ]; then
-            gh secret set FB_STORAGE_STATE \
-              --repo "${{ github.repository }}" < storage_state.json
-            echo "✅ FB_STORAGE_STATE secret refreshed"
-          else
-            echo "⚠️  storage_state.json not found — skipping secret refresh"
-          fi
-
-      # ── 8. Upload debug artefacts ─────────────────────────────────────────
+      # ── 7. Upload debug artefacts ─────────────────────────────────────────
       - name: Upload screenshots & debug files
         if: always()
         uses: actions/upload-artifact@v4
@@ -125,7 +127,7 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
-      # ── 9. Self-requeue — keep the loop alive across job boundaries ───────
+      # ── 8. Self-requeue — keep the loop alive across job boundaries ───────
       #
       # After the loop window ends, we trigger a new workflow_dispatch run
       # with the same sheet ID so posting continues seamlessly.
