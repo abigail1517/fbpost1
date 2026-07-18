@@ -116,7 +116,7 @@ from playwright.async_api import async_playwright
 FB_STORAGE_STATE_ENV      = "FB_STORAGE_STATE"      # one-time seed fallback only
 GOOGLE_CREDS_ENV          = "GOOGLE_CREDENTIALS_JSON"
 CAPTIONS_SHEET_ID_ENV     = "CAPTIONS_SHEET_ID"
-DEFAULT_CAPTIONS_SHEET_ID = "1aAwd5dY5aozXDtqYZK_SNpd7-mIlZFCndJHZ8A0-lIg"
+DEFAULT_CAPTIONS_SHEET_ID = "1ICgS97JJ-Hrs9qsI1UV-xJvPg7ovmSHStGQPoOYr0Dk"
 
 REPO_ID = os.environ.get("REPO_ID") or f"{socket.gethostname()}-{uuid.uuid4().hex[:6]}"
 
@@ -446,10 +446,8 @@ def claim_pages(sh: Sheet, master: dict) -> list[dict]:
 
     rows, _ = sh.as_dicts(PAGES_TAB)
     ttl = _to_int(master.get("lockttlminutes"), 90)
-    print(f"🔍 DEBUG: as_dicts(Pages) returned {len(rows)} row(s): {rows}")   # <-- add this
+    print(f"🔍 DEBUG: as_dicts(Pages) returned {len(rows)} row(s): {rows}")
     claimed = []
-
-for row in rows:
 
     for row in rows:
         page_id = row.get("PageId", "").strip()
