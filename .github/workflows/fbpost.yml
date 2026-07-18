@@ -1,0 +1,159 @@
+name: Facebook Reel Upload (Loop)
+
+on:
+  workflow_dispatch:
+    inputs:
+      captions_sheet_id:
+        description: "Google Sheet ID holding Caption / MegaFolder / MegaMoveFolder / LoopIntervalMinutes / MaxRuntimeMinutes (defaults to the shared sheet if left blank)"
+        required: false
+        default: "1aAwd5dY5aozXDtqYZK_SNpd7-mIlZFCndJHZ8A0-lIg"
+        type: string
+
+jobs:
+  upload-reel-loop:
+    runs-on: ubuntu-latest
+    # Hard technical ceiling — GitHub kills jobs at 6 h no matter what.
+    # The script itself exits earlier, based on MaxRuntimeMinutes in the
+    # sheet; this is just a backstop so a bad/missing sheet value can
+    # never make the job run into GitHub's own limit.
+    timeout-minutes: 330
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── 2. Python ────────────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ── 3. Dependencies ──────────────────────────────────────────────────
+      - name: Install Python dependencies
+        run: |
+          pip install playwright schedule \
+                      google-auth google-auth-httplib2 google-api-python-client
+          playwright install chromium --with-deps
+
+      # ── 4. rclone (Mega.nz access) ──────────────────────────────────────
+      - name: Install rclone
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+          rclone version
+
+      - name: Configure rclone (Mega.nz remote)
+        env:
+          RCLONE_CONF_MEGA: ${{ secrets.RCLONE_CONF_MEGA }}
+        run: |
+          if [ -z "$RCLONE_CONF_MEGA" ]; then
+            echo "❌ RCLONE_CONF_MEGA secret is not set — cannot configure the 'mega' remote"
+            exit 1
+          fi
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF_MEGA" > ~/.config/rclone/rclone.conf
+          echo "✅ rclone.conf written (contents hidden)"
+          echo "Configured remotes:"
+          rclone listremotes
+
+      # ── 5. Verify secrets / inputs ───────────────────────────────────────
+      - name: Verify required inputs / secrets
+        env:
+          FB_STORAGE_STATE:        ${{ secrets.FB_STORAGE_STATE }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          RCLONE_CONF_MEGA:        ${{ secrets.RCLONE_CONF_MEGA }}
+        run: |
+          echo "📁 Workspace contents:"
+          ls -lh
+          echo ""
+          echo "Checking secrets…"
+          echo "ℹ️  FB_STORAGE_STATE is now OPTIONAL — it's only used as a one-time"
+          echo "   seed if the 'FbStorageState' cell in the Google Sheet is empty."
+          echo "   Once seeded, the script refreshes the session in the sheet itself"
+          echo "   after every run, so this secret can be left unset going forward."
+          for VAR_NAME in GOOGLE_CREDENTIALS_JSON RCLONE_CONF_MEGA; do
+            VAL="${!VAR_NAME}"
+            if [ -n "$VAL" ]; then
+              echo "✅ $VAR_NAME is set"
+            else
+              echo "❌ $VAR_NAME is MISSING"
+            fi
+          done
+          if [ -n "$FB_STORAGE_STATE" ]; then
+            echo "✅ FB_STORAGE_STATE is set (optional seed)"
+          else
+            echo "ℹ️  FB_STORAGE_STATE is not set — fine as long as the sheet's "
+            echo "   'FbStorageState' cell already has a session in it"
+          fi
+          echo "📝 Captions/settings sheet: ${{ inputs.captions_sheet_id }}"
+          echo "ℹ️  Mega.nz source folder, move folder, loop interval, max runtime,"
+          echo "   URL-replace settings, and the Facebook session are all read from"
+          echo "   that sheet's row 2 at runtime."
+          echo "   Default Mega.nz source folder if left blank: fbreels"
+
+      # ── 6. Run the loop ──────────────────────────────────────────────────
+      #
+      # The Python scheduler reads LoopIntervalMinutes / MaxRuntimeMinutes
+      # from the sheet itself and exits cleanly once that window elapses.
+      # The "Self-requeue" step below then triggers a fresh workflow run
+      # so posting continues without interruption.
+      #
+      # The Facebook session (storage_state) is read from the sheet's
+      # 'FbStorageState' cell and refreshed back into that same cell after
+      # every run — FB_STORAGE_STATE here is only a fallback seed for the
+      # very first run, before the sheet has ever been populated.
+      #
+      - name: Run upload loop
+        env:
+          TZ:                      "Asia/Karachi"
+          FB_STORAGE_STATE:        ${{ secrets.FB_STORAGE_STATE }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          CAPTIONS_SHEET_ID:       ${{ inputs.captions_sheet_id }}
+        run: |
+          echo "🔁 Starting loop — timing is controlled by the Google Sheet"
+          python fbpost.py
+          echo "⏹️  Loop window finished"
+
+      # ── 7. Upload debug artefacts ─────────────────────────────────────────
+      - name: Upload screenshots & debug files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reel-upload-result-${{ github.run_number }}
+          path: |
+            *.png
+            screenshots/*.png
+            *.html
+          retention-days: 7
+          if-no-files-found: warn
+
+      # ── 8. Self-requeue — keep the loop alive across job boundaries ───────
+      #
+      # After the loop window ends, we trigger a new workflow_dispatch run
+      # with the same sheet ID so posting continues seamlessly.
+      #
+      # Requires the GH_PAT secret (fine-grained PAT with
+      # "Actions: Read & Write" permission on this repo).
+      #
+      # To STOP the loop: cancel the currently-running job in the
+      # GitHub Actions UI before this step executes, OR remove GH_PAT
+      # from your repo secrets.
+      #
+      - name: Self-requeue workflow
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "⚠️  GH_PAT not set — self-requeue skipped (loop will not continue)"
+            exit 0
+          fi
+
+          echo "🔄 Requeueing workflow for next window…"
+          gh workflow run \
+            "${{ github.workflow }}" \
+            --repo "${{ github.repository }}" \
+            --ref "${{ github.ref_name }}" \
+            --field captions_sheet_id="${{ inputs.captions_sheet_id }}"
+
+          echo "✅ Next job queued — loop will continue uninterrupted"
