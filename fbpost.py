@@ -116,7 +116,7 @@ from playwright.async_api import async_playwright
 FB_STORAGE_STATE_ENV      = "FB_STORAGE_STATE"      # one-time seed fallback only
 GOOGLE_CREDS_ENV          = "GOOGLE_CREDENTIALS_JSON"
 CAPTIONS_SHEET_ID_ENV     = "CAPTIONS_SHEET_ID"
-DEFAULT_CAPTIONS_SHEET_ID = "1aAwd5dY5aozXDtqYZK_SNpd7-mIlZFCndJHZ8A0-lIg"
+DEFAULT_CAPTIONS_SHEET_ID = "1ICgS97JJ-Hrs9qsI1UV-xJvPg7ovmSHStGQPoOYr0Dk"
 
 REPO_ID = os.environ.get("REPO_ID") or f"{socket.gethostname()}-{uuid.uuid4().hex[:6]}"
 
@@ -555,6 +555,36 @@ def mega_move_to_uploaded(page_id, src_folder: str, dst_folder: str, file_name: 
     if rc != 0:
         raise RuntimeError(f"rclone move failed: {err.strip()[:300]}")
     ok(page_id, "Moved to uploaded folder")
+
+
+# ── Video claiming — prevents two pages sharing a Mega folder from ever
+# picking the same file. A "move" is the closest thing rclone/Mega gives us
+# to an atomic claim: if two workers race to moveto the same source file,
+# only one succeeds (the other's source no longer exists once the winner's
+# move lands), so the loser naturally falls through to the next candidate.
+# Note: depending on the Mega backend's support for server-side move, this
+# may internally be a copy+delete rather than a true atomic rename — in
+# practice the race window is small, but it isn't a hard guarantee.
+
+def mega_claim_folder(mega_folder: str, page_id: str) -> str:
+    return f"{mega_folder}/_claimed_{page_id}"
+
+
+def mega_try_claim(page_id, src_folder: str, file_name: str, claim_folder: str) -> bool:
+    src = f"{MEGA_REMOTE_NAME}:{src_folder}/{file_name}"
+    dst = f"{MEGA_REMOTE_NAME}:{claim_folder}/{file_name}"
+    rc, out, err = _run_rclone(page_id, ["moveto", src, dst])
+    return rc == 0
+
+
+def mega_return_to_pool(page_id, claim_folder: str, mega_folder: str, file_name: str) -> bool:
+    src = f"{MEGA_REMOTE_NAME}:{claim_folder}/{file_name}"
+    dst = f"{MEGA_REMOTE_NAME}:{mega_folder}/{file_name}"
+    rc, out, err = _run_rclone(page_id, ["moveto", src, dst])
+    if rc != 0:
+        warn(page_id, f"Could not return '{file_name}' to the pool: {err.strip()[:200]}")
+        return False
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1214,30 +1244,71 @@ class PageWorker:
         pid = cfg.page_id
         step(pid, f"Post cycle starting (mode={cfg.post_mode})")
 
-        try:
-            videos = mega_list_videos(pid, cfg.mega_folder)
-        except Exception as e:
-            fail(pid, f"Could not list Mega folder: {e}")
-            return
-        if not videos:
-            info(pid, "No videos pending — nothing to do this cycle")
-            return
+        claim_folder = mega_claim_folder(cfg.mega_folder, pid)
 
-        video_meta = videos[0]
-        file_name = video_meta["Name"]
+        # Resume a video this same page already claimed but didn't finish
+        # posting (e.g. the worker crashed mid-upload last cycle) before
+        # trying to claim a brand new one.
+        try:
+            leftover = mega_list_videos(pid, claim_folder)
+        except Exception:
+            leftover = []
+
+        claimed_file, claimed_match = None, None
+
+        if leftover:
+            claimed_file = leftover[0]["Name"]
+            info(pid, f"Resuming previously-claimed video: {claimed_file}")
+            if cfg.post_mode == "queue":
+                claimed_match = postqueue_find_for_file(self.sh, pid, claimed_file)
+                if not claimed_match:
+                    warn(pid, f"Resumed claim '{claimed_file}' has no PostQueue row anymore — returning to pool")
+                    mega_return_to_pool(pid, claim_folder, cfg.mega_folder, claimed_file)
+                    return
+        else:
+            try:
+                videos = mega_list_videos(pid, cfg.mega_folder)
+            except Exception as e:
+                fail(pid, f"Could not list Mega folder: {e}")
+                return
+            if not videos:
+                info(pid, "No videos pending — nothing to do this cycle")
+                return
+
+            # Walk the list oldest-first, trying to CLAIM (move) each one.
+            # In queue mode, skip straight past any file with no matching
+            # caption yet rather than claiming it for nothing.
+            for v in videos:
+                name = v["Name"]
+                match = None
+                if cfg.post_mode == "queue":
+                    match = postqueue_find_for_file(self.sh, pid, name)
+                    if not match:
+                        continue
+                if mega_try_claim(pid, cfg.mega_folder, name, claim_folder):
+                    claimed_file, claimed_match = name, match
+                    ok(pid, f"Claimed video: {name}")
+                    break
+                info(pid, f"Lost the claim race on '{name}' to another worker — trying next")
+
+            if not claimed_file:
+                if cfg.post_mode == "queue":
+                    warn(pid, "No pending video currently has a matching PostQueue caption — skipping this cycle")
+                else:
+                    warn(pid, "Could not claim any video this cycle (all lost the race) — skipping")
+                return
+
+        file_name = claimed_file
 
         # ── Build the caption for this run, depending on PostMode ─────────
         used_url_rows, url_status_col = [], None
         pq_row_num = None
 
         if cfg.post_mode == "queue":
-            match = postqueue_find_for_file(self.sh, pid, file_name)
-            if not match:
-                warn(pid, f"PostMode=queue but no pending PostQueue row for '{file_name}' — skipping this cycle")
-                return
-            caption, pq_row_num = match
+            caption, pq_row_num = claimed_match
             if not caption.strip():
-                warn(pid, f"PostQueue row for '{file_name}' has an empty caption — skipping")
+                warn(pid, f"PostQueue row for '{file_name}' has an empty caption — returning video to pool")
+                mega_return_to_pool(pid, claim_folder, cfg.mega_folder, file_name)
                 return
         else:
             roll = random.randint(1, 100)
@@ -1260,9 +1331,12 @@ class PageWorker:
 
         with tempfile.TemporaryDirectory() as tmp:
             try:
-                local_path = mega_download_video(pid, cfg.mega_folder, file_name, tmp)
+                # Downloaded from the CLAIM folder — this page is the sole
+                # owner of this file until it's moved out again below.
+                local_path = mega_download_video(pid, claim_folder, file_name, tmp)
             except Exception as e:
                 fail(pid, f"Download failed: {e}")
+                mega_return_to_pool(pid, claim_folder, cfg.mega_folder, file_name)
                 return
 
             try:
@@ -1276,9 +1350,9 @@ class PageWorker:
 
         if published:
             try:
-                mega_move_to_uploaded(pid, cfg.mega_folder, cfg.mega_move_folder, file_name)
+                mega_move_to_uploaded(pid, claim_folder, cfg.mega_move_folder, file_name)
             except Exception as e:
-                warn(pid, f"Move to uploaded failed: {e}")
+                warn(pid, f"Move to uploaded failed (video stays claimed under {claim_folder} for next cycle): {e}")
 
             if cfg.post_mode == "queue" and pq_row_num:
                 postqueue_mark_posted(self.sh, pq_row_num)
@@ -1289,7 +1363,8 @@ class PageWorker:
             if lastfile_col is not None:
                 self.sh.write_cell(PAGES_TAB, cfg.row_num, lastfile_col, file_name)
         else:
-            warn(pid, "Upload not confirmed — video left in source folder for retry")
+            warn(pid, "Upload not confirmed — returning video to the shared pool for retry")
+            mega_return_to_pool(pid, claim_folder, cfg.mega_folder, file_name)
 
         lastrun_col = self.col_index.get("lastrunat")
         if lastrun_col is not None:
