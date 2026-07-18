@@ -169,12 +169,19 @@ SETTINGS_DEFAULTS = {
                                        # caption "goes against our Community Standards", swap
                                        # in a fresh URL from the Urls tab and retry this many
                                        # extra times before giving up (rotation mode only).
+    "urlswaponrejectonly":    "FALSE", # FALSE (default) = UrlReplaceEnabled swaps in a fresh
+                                       # Urls-tab link on EVERY post (the old "rotation" /
+                                       # unique-tracking-link behavior).
+                                       # TRUE = keep posting the caption's own fixed URL as-is
+                                       # every time; the Urls tab is touched ONLY as a fallback
+                                       # pool when Facebook rejects that fixed link, to swap in
+                                       # a replacement and retry.
 }
 
 PAGES_HEADERS = [
     "PageId", "PageName", "Status", "MegaFolder", "MegaMoveFolder", "Caption",
     "WithoutLinkCap", "Link_Percentage", "LoopIntervalMinutes", "UrlReplaceCount",
-    "UrlReplaceMode", "UrlReplaceEnabled", "PostMode", "FbStorageState",
+    "UrlReplaceMode", "UrlReplaceEnabled", "UrlSwapOnRejectOnly", "PostMode", "FbStorageState",
     "LockedBy", "LockedAt", "LastRunAt", "LastPostedFile", "Notes",
     "AssignedRepo", "AssignedStatus", "AssignedAt",
 ]
@@ -453,6 +460,7 @@ class PageConfig:
     url_replace_count: int
     url_replace_mode: str
     url_replace_enabled: bool
+    url_swap_on_reject_only: bool
     post_mode: str                 # "rotation" | "queue"
     storage_state_json: str | None
     max_runtime_minutes: int
@@ -475,6 +483,7 @@ def build_page_config(row: dict, master: dict, max_runtime_minutes: int) -> Page
         url_replace_count=_to_int(effective(row, master, "urlreplacecount", "UrlReplaceCount"), 1),
         url_replace_mode=(effective(row, master, "urlreplacemode", "UrlReplaceMode") or "unique").lower(),
         url_replace_enabled=_to_bool(effective(row, master, "urlreplaceenabled", "UrlReplaceEnabled"), True),
+        url_swap_on_reject_only=_to_bool(effective(row, master, "urlswaponrejectonly", "UrlSwapOnRejectOnly"), False),
         post_mode=(effective(row, master, "postmode", "PostMode") or "rotation").lower(),
         storage_state_json=row.get("FbStorageState") or None,
         max_runtime_minutes=max_runtime_minutes,
@@ -1497,16 +1506,21 @@ class PageWorker:
                 fail(pid, "No caption configured (Caption / WithoutLinkCap both empty) — skipping")
                 return
 
-        def build_rotation_caption(exclude_rows: set[int]):
+        def build_rotation_caption(exclude_rows: set[int], force_swap: bool):
             """(re)builds the rotation-mode caption from the ORIGINAL
-            template with fresh URL(s) swapped in — used for the first
-            attempt and for every link-rejection retry. exclude_rows lets
-            a retry skip URL rows already tried earlier THIS cycle (they
-            haven't been written back to the sheet as Rejected yet, so
-            urls_get_next alone wouldn't know to avoid them)."""
+            template. If UrlSwapOnRejectOnly is on, the caption's own URL is
+            left untouched (force_swap=False) UNLESS force_swap=True (i.e.
+            this is a retry after Facebook rejected it) — only then do we
+            reach into the Urls tab. If UrlSwapOnRejectOnly is off, we swap
+            in a fresh Urls-tab URL every time, same as before.
+            exclude_rows lets a retry skip URL rows already tried earlier
+            THIS cycle (they haven't been written back to the sheet as
+            Rejected yet, so urls_get_next alone wouldn't know to avoid
+            them)."""
             cap = base_caption
             rows_used, status_col = [], None
-            if use_link and cfg.url_replace_enabled:
+            should_swap = use_link and cfg.url_replace_enabled and (force_swap or not cfg.url_swap_on_reject_only)
+            if should_swap:
                 n_matches = len(URL_REGEX.findall(cap))
                 n_to_replace = min(cfg.url_replace_count, n_matches) if n_matches else cfg.url_replace_count
                 fetch_count = 1 if cfg.url_replace_mode == "same" else max(n_to_replace, 1)
@@ -1526,7 +1540,7 @@ class PageWorker:
 
         used_url_rows, url_status_col = [], None
         if cfg.post_mode != "queue":
-            caption, used_url_rows, url_status_col = build_rotation_caption(exclude_rows=set())
+            caption, used_url_rows, url_status_col = build_rotation_caption(exclude_rows=set(), force_swap=False)
 
         with tempfile.TemporaryDirectory() as tmp:
             try:
@@ -1581,7 +1595,8 @@ class PageWorker:
                     break
 
                 info(pid, f"Retrying with a fresh URL (attempt {attempt + 1}/{max_attempts})")
-                caption, used_url_rows, url_status_col = build_rotation_caption(exclude_rows=tried_url_rows)
+                caption, used_url_rows, url_status_col = build_rotation_caption(
+                    exclude_rows=tried_url_rows, force_swap=True)
                 if not used_url_rows and use_link and cfg.url_replace_enabled:
                     warn(pid, "No more unused URLs left to retry with — giving up this cycle")
                     break
