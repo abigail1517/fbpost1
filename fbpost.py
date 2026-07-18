@@ -165,6 +165,10 @@ SETTINGS_DEFAULTS = {
                                        # disabled/broken) before another repo is allowed to take
                                        # its pages over. Set very large (e.g. 525600) for a
                                        # permanent, never-auto-reassigned pin.
+    "linkrejectmaxretries":   "2",     # if Facebook rejects a post because the URL in the
+                                       # caption "goes against our Community Standards", swap
+                                       # in a fresh URL from the Urls tab and retry this many
+                                       # extra times before giving up (rotation mode only).
 }
 
 PAGES_HEADERS = [
@@ -454,6 +458,7 @@ class PageConfig:
     max_runtime_minutes: int
     heartbeat_minutes: int
     lock_ttl_minutes: int
+    link_reject_max_retries: int
 
 
 def build_page_config(row: dict, master: dict, max_runtime_minutes: int) -> PageConfig:
@@ -475,6 +480,7 @@ def build_page_config(row: dict, master: dict, max_runtime_minutes: int) -> Page
         max_runtime_minutes=max_runtime_minutes,
         heartbeat_minutes=_to_int(master.get("heartbeatminutes"), 15),
         lock_ttl_minutes=_to_int(master.get("lockttlminutes"), 90),
+        link_reject_max_retries=_to_int(master.get("linkrejectmaxretries"), 2),
     )
 
 
@@ -716,7 +722,7 @@ def mega_return_to_pool(page_id, claim_folder: str, mega_folder: str, file_name:
 # URLS TAB — rotation-mode link swapping, optionally scoped per PageId
 # ─────────────────────────────────────────────────────────────────────────────
 
-URLS_POSTED_VALUES = {"posted", "replaced"}
+URLS_POSTED_VALUES = {"posted", "replaced", "rejected"}
 
 def urls_get_next(sh: Sheet, page_id: str, count: int):
     rows, col_index = sh.as_dicts(URLS_TAB)
@@ -1052,19 +1058,44 @@ async def enter_caption_lexical(page_id, page, caption: str) -> bool:
     return False
 
 
-async def run_upload_flow(page_id, page, caption: str, video_path: str) -> bool:
+LINK_REJECTION_SELECTORS = [
+    'span:has-text("couldn\'t be shared")',
+    'span:has-text("goes against our Community Standards")',
+    'div:has-text("goes against our Community Standards")',
+]
+
+
+async def detect_link_rejection(page_id, page) -> bool:
+    """True if Facebook is showing its 'content couldn't be shared, this
+    link goes against our Community Standards' panel (as seen when a
+    URL — commonly a shortened t.co link — gets auto-flagged). This is a
+    hard, link-specific rejection: retrying with the SAME caption/URL will
+    just fail again, so the caller should swap in a different URL rather
+    than treat it like a generic transient failure."""
+    for sel in LINK_REJECTION_SELECTORS:
+        try:
+            if await page.locator(sel).count() > 0:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+async def run_upload_flow(page_id, page, caption: str, video_path: str) -> dict:
+    """Returns {"published": bool, "link_rejected": bool}."""
     published = False
+    link_rejected = False
 
     step(page_id, "Loading Facebook homepage")
     try:
         await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=60_000)
     except Exception as e:
         fail(page_id, f"Page load failed: {e}")
-        return False
+        return {"published": False, "link_rejected": False}
     await asyncio.sleep(8)
 
     if not await ensure_logged_in(page_id, page):
-        return False
+        return {"published": False, "link_rejected": False}
     ok(page_id, "Login confirmed")
 
     step(page_id, "Navigating to Reels create")
@@ -1072,7 +1103,7 @@ async def run_upload_flow(page_id, page, caption: str, video_path: str) -> bool:
         await page.goto("https://www.facebook.com/reels/create/", wait_until="domcontentloaded", timeout=60_000)
     except Exception as e:
         fail(page_id, f"Nav to reels/create failed: {e}")
-        return False
+        return {"published": False, "link_rejected": False}
     await asyncio.sleep(8)
 
     step(page_id, "Attaching video")
@@ -1110,7 +1141,7 @@ async def run_upload_flow(page_id, page, caption: str, video_path: str) -> bool:
     if not uploaded:
         fail(page_id, "Could not attach video")
         await save_screenshot(page_id, page, "no_upload")
-        return False
+        return {"published": False, "link_rejected": False}
     ok(page_id, "Video attached")
 
     step(page_id, "Waiting for Next to become active")
@@ -1225,12 +1256,24 @@ async def run_upload_flow(page_id, page, caption: str, video_path: str) -> bool:
     if not post_clicked:
         fail(page_id, "Could not click Post/Publish")
         await save_screenshot(page_id, page, "no_post_button")
-        return False
+        return {"published": False, "link_rejected": False}
+
+    # Check immediately — Facebook's "couldn't be shared, this link goes
+    # against our Community Standards" panel can appear right after the
+    # Post click, before we ever get to the confirmation-wait loop below.
+    if await detect_link_rejection(page_id, page):
+        link_rejected = True
+        fail(page_id, "Facebook rejected the post: link violates Community Standards")
+        await save_screenshot(page_id, page, "link_rejected")
+        return {"published": False, "link_rejected": True}
 
     step(page_id, "Waiting for publish confirmation")
     confirm_selectors = ['span:has-text("Your reel is now shared")', 'span:has-text("Reel posted")',
                           'span:has-text("Published")', 'span:has-text("Your reel")', 'span:has-text("shared")']
     for elapsed in range(0, 60, 5):
+        if await detect_link_rejection(page_id, page):
+            link_rejected = True
+            break
         for sel in confirm_selectors:
             try:
                 if await page.locator(sel).count() > 0:
@@ -1240,10 +1283,18 @@ async def run_upload_flow(page_id, page, caption: str, video_path: str) -> bool:
         if published: break
         await asyncio.sleep(5)
 
+    if link_rejected:
+        fail(page_id, "Facebook rejected the post: link violates Community Standards")
+        await save_screenshot(page_id, page, "link_rejected")
+        return {"published": False, "link_rejected": True}
+
     if not published:
         try:
+            # Only trust "the Post button disappeared" as a success signal
+            # if the rejection panel is definitely NOT what made it
+            # disappear/get covered.
             gone = await page.locator('div[aria-label="Post"][role="button"]').count() == 0
-            if gone and post_clicked:
+            if gone and post_clicked and not await detect_link_rejection(page_id, page):
                 published = True
         except Exception:
             pass
@@ -1253,7 +1304,7 @@ async def run_upload_flow(page_id, page, caption: str, video_path: str) -> bool:
         ok(page_id, "🎉 Published")
     else:
         warn(page_id, "Could not confirm publish — check screenshot")
-    return published
+    return {"published": published, "link_rejected": link_rejected}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1429,8 +1480,8 @@ class PageWorker:
         file_name = claimed_file
 
         # ── Build the caption for this run, depending on PostMode ─────────
-        used_url_rows, url_status_col = [], None
         pq_row_num = None
+        base_caption, use_link = None, False   # rotation-mode only
 
         if cfg.post_mode == "queue":
             caption, pq_row_num = claimed_match
@@ -1441,21 +1492,41 @@ class PageWorker:
         else:
             roll = random.randint(1, 100)
             use_link = roll <= cfg.link_percentage
-            caption = cfg.caption if use_link else (cfg.without_link_caption or cfg.caption)
-            if not caption.strip():
+            base_caption = cfg.caption if use_link else (cfg.without_link_caption or cfg.caption)
+            if not base_caption.strip():
                 fail(pid, "No caption configured (Caption / WithoutLinkCap both empty) — skipping")
                 return
+
+        def build_rotation_caption(exclude_rows: set[int]):
+            """(re)builds the rotation-mode caption from the ORIGINAL
+            template with fresh URL(s) swapped in — used for the first
+            attempt and for every link-rejection retry. exclude_rows lets
+            a retry skip URL rows already tried earlier THIS cycle (they
+            haven't been written back to the sheet as Rejected yet, so
+            urls_get_next alone wouldn't know to avoid them)."""
+            cap = base_caption
+            rows_used, status_col = [], None
             if use_link and cfg.url_replace_enabled:
-                n_matches = len(URL_REGEX.findall(caption))
+                n_matches = len(URL_REGEX.findall(cap))
                 n_to_replace = min(cfg.url_replace_count, n_matches) if n_matches else cfg.url_replace_count
                 fetch_count = 1 if cfg.url_replace_mode == "same" else max(n_to_replace, 1)
-                new_urls, used_url_rows, url_status_col = urls_get_next(self.sh, pid, fetch_count)
+                fetched_urls, fetched_rows, status_col = urls_get_next(
+                    self.sh, pid, fetch_count + len(exclude_rows))
+                pairs = [(u, r) for u, r in zip(fetched_urls, fetched_rows) if r not in exclude_rows][:fetch_count]
+                new_urls = [u for u, _ in pairs]
+                rows_used = [r for _, r in pairs]
                 if new_urls:
-                    if cfg.url_replace_mode == "unique" and len(new_urls) < n_to_replace:
-                        n_to_replace = len(new_urls)
-                    caption = replace_urls_in_caption(caption, new_urls, cfg.url_replace_mode, n_to_replace)
+                    n_eff = n_to_replace
+                    if cfg.url_replace_mode == "unique" and len(new_urls) < n_eff:
+                        n_eff = len(new_urls)
+                    cap = replace_urls_in_caption(cap, new_urls, cfg.url_replace_mode, n_eff)
                 else:
                     warn(pid, "No unused URLs available — posting caption without swap")
+            return cap, rows_used, status_col
+
+        used_url_rows, url_status_col = [], None
+        if cfg.post_mode != "queue":
+            caption, used_url_rows, url_status_col = build_rotation_caption(exclude_rows=set())
 
         with tempfile.TemporaryDirectory() as tmp:
             try:
@@ -1467,14 +1538,53 @@ class PageWorker:
                 mega_return_to_pool(pid, claim_folder, cfg.mega_folder, file_name)
                 return
 
-            try:
-                page = await self.context.new_page()
-                published = await run_upload_flow(pid, page, caption, local_path)
-                await page.close()
-            except Exception as e:
-                fail(pid, f"Upload flow crashed: {e}")
-                import traceback; print(traceback.format_exc())
-                published = False
+            # ── Upload attempt loop — retries ONLY on an explicit Facebook
+            # "this link goes against our Community Standards" rejection,
+            # by permanently blacklisting the offending URL row(s) and
+            # swapping in fresh ones from the Urls tab. Any other failure
+            # (login wall, upload glitch, etc.) is NOT retried here — it
+            # falls through to the existing "return video to pool" path.
+            published = False
+            tried_url_rows: set[int] = set()
+            max_attempts = 1 + (cfg.link_reject_max_retries if cfg.post_mode != "queue" else 0)
+
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    page = await self.context.new_page()
+                    result = await run_upload_flow(pid, page, caption, local_path)
+                    await page.close()
+                except Exception as e:
+                    fail(pid, f"Upload flow crashed: {e}")
+                    import traceback; print(traceback.format_exc())
+                    result = {"published": False, "link_rejected": False}
+
+                published = result.get("published", False)
+                if published:
+                    break
+
+                if not result.get("link_rejected"):
+                    break  # non-link failure — don't retry, fall through below
+
+                # Link rejected: blacklist the URL(s) we just used so they're
+                # never picked again, then rebuild the caption with fresh
+                # ones and try again (if we haven't hit the retry limit).
+                if used_url_rows:
+                    urls_mark_posted(self.sh, used_url_rows, url_status_col, status_value="Rejected")
+                    warn(pid, f"Blacklisted rejected URL row(s) {used_url_rows} as 'Rejected'")
+                    tried_url_rows.update(used_url_rows)
+
+                if attempt >= max_attempts:
+                    warn(pid, "Link rejection retry limit reached — giving up this cycle")
+                    break
+                if not (use_link and cfg.url_replace_enabled):
+                    warn(pid, "Link rejected but URL replacement isn't enabled for this page — cannot retry")
+                    break
+
+                info(pid, f"Retrying with a fresh URL (attempt {attempt + 1}/{max_attempts})")
+                caption, used_url_rows, url_status_col = build_rotation_caption(exclude_rows=tried_url_rows)
+                if not used_url_rows and use_link and cfg.url_replace_enabled:
+                    warn(pid, "No more unused URLs left to retry with — giving up this cycle")
+                    break
 
         if published:
             try:
@@ -1485,7 +1595,7 @@ class PageWorker:
             if cfg.post_mode == "queue" and pq_row_num:
                 postqueue_mark_posted(self.sh, pq_row_num)
             if used_url_rows:
-                urls_mark_posted(self.sh, used_url_rows, url_status_col)
+                urls_mark_posted(self.sh, used_url_rows, url_status_col, status_value="Posted")
 
             lastfile_col = self.col_index.get("lastpostedfile")
             if lastfile_col is not None:
