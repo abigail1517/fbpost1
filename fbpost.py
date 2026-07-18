@@ -268,10 +268,31 @@ class Sheet:
         self.id = spreadsheet_id
         self._tab_cache = None
 
+    @staticmethod
+    def _retry(fn, *, attempts=3, base_delay=1.5, page_id=None, what="Sheets call"):
+        """Runs fn() with a few retries on transient network errors (e.g.
+        'EOF occurred in violation of protocol', connection resets) before
+        giving up. A single dropped connection over a long-running loop
+        shouldn't be treated the same as 'this column doesn't exist' or
+        silently skip a heartbeat/lock write."""
+        last_err = None
+        for i in range(1, attempts + 1):
+            try:
+                return fn()
+            except Exception as e:
+                last_err = e
+                if i < attempts:
+                    warn(page_id, f"{what} failed (attempt {i}/{attempts}): {e} — retrying")
+                    time.sleep(base_delay * i)
+        warn(page_id, f"{what} failed after {attempts} attempts: {last_err}")
+        raise last_err
+
     # ---- low level -----------------------------------------------------
     def existing_tabs(self, refresh=False):
         if self._tab_cache is None or refresh:
-            meta = self.svc.spreadsheets().get(spreadsheetId=self.id).execute()
+            meta = self._retry(
+                lambda: self.svc.spreadsheets().get(spreadsheetId=self.id).execute(),
+                what="Sheets metadata read")
             self._tab_cache = {s["properties"]["title"] for s in meta.get("sheets", [])}
         return self._tab_cache
 
@@ -280,18 +301,18 @@ class Sheet:
         touches an existing tab's data (only adds missing header cells if
         the header row is completely empty)."""
         if title not in self.existing_tabs():
-            self.svc.spreadsheets().batchUpdate(
+            self._retry(lambda: self.svc.spreadsheets().batchUpdate(
                 spreadsheetId=self.id,
                 body={"requests": [{"addSheet": {"properties": {"title": title}}}]},
-            ).execute()
+            ).execute(), what=f"create tab '{title}'")
             self._tab_cache = None
             ok(None, f"Created missing tab '{title}'")
         rows = self.read_rows(title, "A1:Z1")
         if not rows or not any(c.strip() for c in rows[0]):
-            self.svc.spreadsheets().values().update(
+            self._retry(lambda: self.svc.spreadsheets().values().update(
                 spreadsheetId=self.id, range=f"'{title}'!A1",
                 valueInputOption="RAW", body={"values": [headers]},
-            ).execute()
+            ).execute(), what=f"write header row for '{title}'")
             ok(None, f"Wrote header row for '{title}': {headers}")
         else:
             info(None, f"Tab '{title}' already has a header row — leaving it as-is")
@@ -316,42 +337,42 @@ class Sheet:
         next_col = len(header)  # 0-indexed next free column
         for i, h in enumerate(missing):
             col_letter = self._col_letter(next_col + i)
-            self.svc.spreadsheets().values().update(
-                spreadsheetId=self.id, range=f"'{title}'!{col_letter}1",
-                valueInputOption="RAW", body={"values": [[h]]},
-            ).execute()
+            self._retry(lambda cl=col_letter, hh=h: self.svc.spreadsheets().values().update(
+                spreadsheetId=self.id, range=f"'{title}'!{cl}1",
+                valueInputOption="RAW", body={"values": [[hh]]},
+            ).execute(), what=f"add column '{h}' to '{title}'")
         ok(None, f"Added missing column(s) to '{title}': {missing}")
 
     def read_rows(self, tab: str, a1_range: str = "A:Z") -> list[list[str]]:
         try:
-            result = self.svc.spreadsheets().values().get(
+            result = self._retry(lambda: self.svc.spreadsheets().values().get(
                 spreadsheetId=self.id, range=f"'{tab}'!{a1_range}"
-            ).execute()
+            ).execute(), what=f"read '{tab}'!{a1_range}")
         except Exception as e:
-            warn(None, f"Sheets read failed ('{tab}'!{a1_range}): {e}")
+            warn(None, f"Sheets read failed ('{tab}'!{a1_range}) after retries: {e}")
             return []
         return result.get("values", [])
 
     def write_cell(self, tab: str, row_num: int, col_idx: int, value: str):
         col_letter = self._col_letter(col_idx)
         try:
-            self.svc.spreadsheets().values().update(
+            self._retry(lambda: self.svc.spreadsheets().values().update(
                 spreadsheetId=self.id, range=f"'{tab}'!{col_letter}{row_num}",
                 valueInputOption="RAW", body={"values": [[value]]},
-            ).execute()
+            ).execute(), what=f"write '{tab}'!{col_letter}{row_num}")
             return True
         except Exception as e:
-            warn(None, f"Write failed '{tab}'!{col_letter}{row_num}: {e}")
+            warn(None, f"Write failed '{tab}'!{col_letter}{row_num}' after retries: {e}")
             return False
 
     def clear_cell(self, tab: str, row_num: int, col_idx: int):
         col_letter = self._col_letter(col_idx)
         try:
-            self.svc.spreadsheets().values().clear(
+            self._retry(lambda: self.svc.spreadsheets().values().clear(
                 spreadsheetId=self.id, range=f"'{tab}'!{col_letter}{row_num}", body={}
-            ).execute()
+            ).execute(), what=f"clear '{tab}'!{col_letter}{row_num}")
         except Exception as e:
-            warn(None, f"Clear failed '{tab}'!{col_letter}{row_num}: {e}")
+            warn(None, f"Clear failed '{tab}'!{col_letter}{row_num}' after retries: {e}")
 
     @staticmethod
     def _col_letter(idx: int) -> str:
@@ -1428,6 +1449,10 @@ class PageWorker:
         cfg = self.cfg
         pid = cfg.page_id
         step(pid, f"Post cycle starting (mode={cfg.post_mode})")
+        info(pid, f"Resolved settings: UrlReplaceEnabled={cfg.url_replace_enabled}, "
+                  f"UrlSwapOnRejectOnly={cfg.url_swap_on_reject_only}, "
+                  f"UrlReplaceMode={cfg.url_replace_mode}, UrlReplaceCount={cfg.url_replace_count}, "
+                  f"Link_Percentage={cfg.link_percentage}, LinkRejectMaxRetries={cfg.link_reject_max_retries}")
 
         claim_folder = mega_claim_folder(cfg.mega_folder, pid)
 
