@@ -116,7 +116,7 @@ from playwright.async_api import async_playwright
 FB_STORAGE_STATE_ENV      = "FB_STORAGE_STATE"      # one-time seed fallback only
 GOOGLE_CREDS_ENV          = "GOOGLE_CREDENTIALS_JSON"
 CAPTIONS_SHEET_ID_ENV     = "CAPTIONS_SHEET_ID"
-DEFAULT_CAPTIONS_SHEET_ID = "1ICgS97JJ-Hrs9qsI1UV-xJvPg7ovmSHStGQPoOYr0Dk"
+DEFAULT_CAPTIONS_SHEET_ID = "1aAwd5dY5aozXDtqYZK_SNpd7-mIlZFCndJHZ8A0-lIg"
 
 REPO_ID = os.environ.get("REPO_ID") or f"{socket.gethostname()}-{uuid.uuid4().hex[:6]}"
 
