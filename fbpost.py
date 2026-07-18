@@ -118,7 +118,24 @@ GOOGLE_CREDS_ENV          = "GOOGLE_CREDENTIALS_JSON"
 CAPTIONS_SHEET_ID_ENV     = "CAPTIONS_SHEET_ID"
 DEFAULT_CAPTIONS_SHEET_ID = "1aAwd5dY5aozXDtqYZK_SNpd7-mIlZFCndJHZ8A0-lIg"
 
-REPO_ID = os.environ.get("REPO_ID") or f"{socket.gethostname()}-{uuid.uuid4().hex[:6]}"
+def _default_repo_id() -> str:
+    """A STABLE identity for this runner across separate job runs.
+    Priority: explicit REPO_ID env var > GITHUB_REPOSITORY (GitHub Actions
+    sets this automatically to "owner/repo" and it is IDENTICAL on every
+    run/job of that workflow) > hostname (last-resort local fallback).
+    We deliberately do NOT fall back to a random uuid anymore: a random
+    per-run id meant every new job run looked like a brand new, unrelated
+    runner to claim_pages()/ASSIGNED_REPO, so a page locked/assigned by
+    "runner-abc123" in one run was invisible to "runner-def456" in the
+    very next run of the SAME repo — pages would sit stuck until the lock
+    TTL expired even though nothing was actually still using them."""
+    gh_repo = os.environ.get("GITHUB_REPOSITORY")  # e.g. "myorg/fb-poster-repo-a"
+    if gh_repo:
+        return gh_repo.strip().replace("/", "-")
+    return socket.gethostname()
+
+
+REPO_ID = os.environ.get("REPO_ID") or _default_repo_id()
 
 VIDEO_EXTENSIONS  = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 MEGA_REMOTE_NAME  = "mega"
@@ -143,6 +160,11 @@ SETTINGS_DEFAULTS = {
     "postmode":               "rotation",
     "lockttlminutes":         "90",
     "heartbeatminutes":       "15",
+    "maxpagesperrepo":        "5",     # a repo will only ever self-assign up to this many pages
+    "assignedttlminutes":     "1440",  # 24h — how long an ASSIGNED_REPO may go quiet (workflow
+                                       # disabled/broken) before another repo is allowed to take
+                                       # its pages over. Set very large (e.g. 525600) for a
+                                       # permanent, never-auto-reassigned pin.
 }
 
 PAGES_HEADERS = [
@@ -150,6 +172,7 @@ PAGES_HEADERS = [
     "WithoutLinkCap", "Link_Percentage", "LoopIntervalMinutes", "UrlReplaceCount",
     "UrlReplaceMode", "UrlReplaceEnabled", "PostMode", "FbStorageState",
     "LockedBy", "LockedAt", "LastRunAt", "LastPostedFile", "Notes",
+    "AssignedRepo", "AssignedStatus", "AssignedAt",
 ]
 SETTINGS_HEADERS  = ["Key", "Value"]
 URLS_HEADERS      = ["Urls", "Status", "PageId"]
@@ -262,6 +285,32 @@ class Sheet:
         else:
             info(None, f"Tab '{title}' already has a header row — leaving it as-is")
 
+    def ensure_columns(self, title: str, required_headers: list[str]):
+        """Appends any headers from required_headers that aren't already
+        present (case-insensitive) to the END of the existing header row,
+        as new columns. Unlike ensure_tab (which only writes headers into a
+        completely empty header row), this is safe to call on a tab that
+        already has data — it never touches existing columns, it only adds
+        new ones after the last used column. Lets an already-in-use sheet
+        pick up new required columns (e.g. AssignedRepo) automatically,
+        without the user having to delete/recreate the tab."""
+        if title not in self.existing_tabs():
+            return  # tab doesn't exist yet — ensure_tab / setup will create it with all headers
+        rows = self.read_rows(title, "A1:Z1")
+        header = rows[0] if rows else []
+        present = {h.strip().lower() for h in header if h.strip()}
+        missing = [h for h in required_headers if h.lower() not in present]
+        if not missing:
+            return
+        next_col = len(header)  # 0-indexed next free column
+        for i, h in enumerate(missing):
+            col_letter = self._col_letter(next_col + i)
+            self.svc.spreadsheets().values().update(
+                spreadsheetId=self.id, range=f"'{title}'!{col_letter}1",
+                valueInputOption="RAW", body={"values": [[h]]},
+            ).execute()
+        ok(None, f"Added missing column(s) to '{title}': {missing}")
+
     def read_rows(self, tab: str, a1_range: str = "A:Z") -> list[list[str]]:
         try:
             result = self.svc.spreadsheets().values().get(
@@ -332,6 +381,7 @@ def setup_sheet(sheets_service, spreadsheet_id):
     sh.ensure_tab(PAGES_TAB, PAGES_HEADERS)
     sh.ensure_tab(URLS_TAB, URLS_HEADERS)
     sh.ensure_tab(POSTQUEUE_TAB, POSTQUEUE_HEADERS)
+    sh.ensure_columns(PAGES_TAB, ["AssignedRepo", "AssignedStatus", "AssignedAt"])
 
     # Seed Settings with defaults for any key not already present
     settings_rows, _ = sh.as_dicts(SETTINGS_TAB)
@@ -433,12 +483,28 @@ def build_page_config(row: dict, master: dict, max_runtime_minutes: int) -> Page
 # ─────────────────────────────────────────────────────────────────────────────
 
 def claim_pages(sh: Sheet, master: dict) -> list[dict]:
-    """Reads the Pages tab and claims every Active, unlocked-or-stale-locked
-    row for THIS runner (REPO_ID) by writing LockedBy/LockedAt. Returns the
-    row dicts (post-claim, with LockedBy already set to us) that we now own.
-    Optimistic locking: we re-read immediately after writing to confirm no
-    one else's id landed there in the meantime (best-effort — Sheets has no
-    real compare-and-swap, but the re-read closes almost all of the race)."""
+    """Reads the Pages tab and claims pages for THIS runner (REPO_ID) in two
+    layers:
+
+    LAYER 1 — ASSIGNED_REPO (persistent, sticky, capacity-bounded):
+        Each Active page gets permanently pinned to whichever repo claims
+        it first, up to MaxPagesPerRepo pages per repo. A page already
+        assigned to a DIFFERENT repo is skipped outright by us — no lock
+        race, no TTL guessing, we just don't touch it. If a sheet has more
+        pages than one repo's capacity, the overflow pages stay unassigned
+        and are picked up by the next repo that runs with spare capacity.
+        If an assigned repo goes quiet for AssignedTtlMinutes (workflow
+        disabled/broken elsewhere), its pages become eligible for another
+        repo to take over — this is the ONLY way assignment ever moves.
+
+    LAYER 2 — LockedBy/LockedAt (transient, per-run concurrency lock):
+        Unchanged from before, this just prevents two *simultaneous* job
+        runs of the pages we already own from double-processing the same
+        page. Because REPO_ID is now stable across runs (see
+        _default_repo_id), a page we locked in a previous run of this same
+        repo is always instantly recognized as ours and reclaimed, instead
+        of looking like a stale lock from a stranger.
+    """
     step(None, f"Claiming pages for runner '{REPO_ID}'")
     header = sh.read_rows(PAGES_TAB, "A1:Z1")
     if not header:
@@ -449,19 +515,61 @@ def claim_pages(sh: Sheet, master: dict) -> list[dict]:
         fail(None, f"'{PAGES_TAB}' is missing required columns — run --setup-sheet")
         return []
 
+    has_assignment_cols = all(c in col_index for c in ("assignedrepo", "assignedstatus", "assignedat"))
+    if not has_assignment_cols:
+        warn(None, f"'{PAGES_TAB}' is missing AssignedRepo/AssignedStatus/AssignedAt columns — "
+                    f"running without per-repo page assignment this cycle (columns should be "
+                    f"auto-added at startup; if this persists, run --setup-sheet)")
+
     rows, _ = sh.as_dicts(PAGES_TAB)
     ttl = _to_int(master.get("lockttlminutes"), 90)
+    max_per_repo = max(1, _to_int(master.get("maxpagesperrepo"), 5))
+    assigned_ttl = _to_int(master.get("assignedttlminutes"), 1440)
     claimed = []
 
-    for row in rows:
-        page_id = row.get("PageId", "").strip()
-        if not page_id:
-            continue
-        status = (row.get("Status", "") or "Active").strip().lower()
-        if status == "paused":
-            info(None, f"[{page_id}] Status=Paused — skipping")
-            continue
+    def active_rows():
+        return [r for r in rows
+                if r.get("PageId", "").strip()
+                and (r.get("Status", "") or "Active").strip().lower() != "paused"]
 
+    my_assigned_count = 0
+    if has_assignment_cols:
+        my_assigned_count = sum(
+            1 for r in active_rows() if r.get("AssignedRepo", "").strip() == REPO_ID
+        )
+
+    for row in active_rows():
+        page_id = row.get("PageId", "").strip()
+
+        # ── LAYER 1: ASSIGNED_REPO ────────────────────────────────────
+        if has_assignment_cols:
+            ar_col = col_index["assignedrepo"]
+            as_col = col_index["assignedstatus"]
+            aa_col = col_index["assignedat"]
+            assigned_repo = row.get("AssignedRepo", "").strip()
+            assigned_at = row.get("AssignedAt", "").strip()
+
+            if assigned_repo and assigned_repo != REPO_ID:
+                if minutes_since(assigned_at) <= assigned_ttl:
+                    info(None, f"[{page_id}] assigned to repo '{assigned_repo}' — not ours, skipping")
+                    continue
+                warn(None, f"[{page_id}] assignment to '{assigned_repo}' is stale "
+                            f"({minutes_since(assigned_at):.0f}m > {assigned_ttl}m) — up for reassignment")
+                assigned_repo = ""  # falls through to (re)assignment below
+
+            if not assigned_repo:
+                if my_assigned_count >= max_per_repo:
+                    info(None, f"[{page_id}] unassigned, but repo '{REPO_ID}' already has "
+                               f"{my_assigned_count}/{max_per_repo} page(s) — leaving for another repo")
+                    continue
+                sh.write_cell(PAGES_TAB, row["_row"], ar_col, REPO_ID)
+                sh.write_cell(PAGES_TAB, row["_row"], as_col, "Assigned")
+                sh.write_cell(PAGES_TAB, row["_row"], aa_col, now_iso())
+                my_assigned_count += 1
+                ok(None, f"[{page_id}] assigned to repo '{REPO_ID}' ({my_assigned_count}/{max_per_repo})")
+                row["AssignedRepo"] = REPO_ID  # keep local copy consistent for this pass
+
+        # ── LAYER 2: LockedBy / LockedAt (transient concurrency lock) ─
         locked_by = row.get("LockedBy", "").strip()
         locked_at = row.get("LockedAt", "").strip()
         is_free = (not locked_by) or (locked_by == REPO_ID) or (minutes_since(locked_at) > ttl)
@@ -1405,9 +1513,22 @@ async def main_async(once: bool):
     thread_count = max(1, _to_int(master.get("threadcount"), 3))
     max_runtime = _to_int(master.get("maxruntimeminutes"), 300)
 
-    claimed_rows = claim_pages(sh, master)
+    # Self-heal: add AssignedRepo/AssignedStatus/AssignedAt to the Pages tab
+    # if this sheet predates them, so existing sheets don't need a manual
+    # --setup-sheet re-run to get per-repo page assignment.
+    try:
+        sh.ensure_columns(PAGES_TAB, ["AssignedRepo", "AssignedStatus", "AssignedAt"])
+    except Exception as e:
+        warn(None, f"Could not verify/add assignment columns on '{PAGES_TAB}': {e}")
+
+    try:
+        claimed_rows = claim_pages(sh, master)
+    except Exception as e:
+        fail(None, f"claim_pages() failed — see traceback below")
+        import traceback; print(traceback.format_exc())
+        raise
     if not claimed_rows:
-        info(None, "No pages available to claim this run (none Active/unlocked)")
+        info(None, "No pages available to claim this run (none Active/unlocked/assigned to us)")
         return
 
     col_index = get_pages_col_index(sh)
