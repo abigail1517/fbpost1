@@ -446,7 +446,10 @@ def claim_pages(sh: Sheet, master: dict) -> list[dict]:
 
     rows, _ = sh.as_dicts(PAGES_TAB)
     ttl = _to_int(master.get("lockttlminutes"), 90)
+    print(f"🔍 DEBUG: as_dicts(Pages) returned {len(rows)} row(s): {rows}")   # <-- add this
     claimed = []
+
+for row in rows:
 
     for row in rows:
         page_id = row.get("PageId", "").strip()
