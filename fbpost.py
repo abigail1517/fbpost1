@@ -510,7 +510,11 @@ def get_pages_col_index(sh: Sheet) -> dict:
 # MEGA.NZ (via rclone)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _run_rclone(page_id, args: list[str], timeout: int = 300):
+def _run_rclone(page_id, args: list[str], timeout: int = 300, quiet_substrings: tuple[str, ...] = ()):
+    """Runs an rclone subcommand. If it fails with stderr containing one of
+    quiet_substrings (case-insensitive), the failure is logged at info level
+    instead of warn — used for expected conditions like a per-page claim
+    folder that simply hasn't been created yet."""
     cmd = ["rclone"] + args
     info(page_id, f"rclone {' '.join(args)}")
     try:
@@ -522,14 +526,27 @@ def _run_rclone(page_id, args: list[str], timeout: int = 300):
         fail(page_id, f"rclone timed out after {timeout}s")
         raise
     if result.returncode != 0:
-        warn(page_id, f"rclone exit {result.returncode}: {result.stderr.strip()[:400]}")
+        stderr_lower = (result.stderr or "").lower()
+        if quiet_substrings and any(s.lower() in stderr_lower for s in quiet_substrings):
+            info(page_id, f"rclone exit {result.returncode} (expected): {result.stderr.strip()[:200]}")
+        else:
+            warn(page_id, f"rclone exit {result.returncode}: {result.stderr.strip()[:400]}")
     return result.returncode, result.stdout, result.stderr
 
 
-def mega_list_videos(page_id, folder: str) -> list[dict]:
+def mega_list_videos(page_id, folder: str, missing_dir_ok: bool = False) -> list[dict]:
+    """Lists videos in a Mega folder. If missing_dir_ok is True, a
+    'directory not found' failure (e.g. a per-page claim folder that hasn't
+    been created yet because nothing has ever been claimed there) is treated
+    as an empty folder instead of an error — this is the normal/expected
+    state on a page's first ever run, not a fault."""
     remote_path = f"{MEGA_REMOTE_NAME}:{folder}"
-    rc, out, err = _run_rclone(page_id, ["lsjson", remote_path, "--files-only"])
+    quiet = ("directory not found",) if missing_dir_ok else ()
+    rc, out, err = _run_rclone(page_id, ["lsjson", remote_path, "--files-only"], quiet_substrings=quiet)
     if rc != 0:
+        if missing_dir_ok and "directory not found" in (err or "").lower():
+            info(page_id, f"No claim folder yet at '{folder}' — nothing currently claimed there")
+            return []
         raise RuntimeError(f"rclone lsjson failed: {err.strip()[:300]}")
     entries = json.loads(out) if out.strip() else []
     videos = [e for e in entries if Path(e.get("Name", "")).suffix.lower() in VIDEO_EXTENSIONS]
@@ -1248,10 +1265,13 @@ class PageWorker:
 
         # Resume a video this same page already claimed but didn't finish
         # posting (e.g. the worker crashed mid-upload last cycle) before
-        # trying to claim a brand new one.
+        # trying to claim a brand new one. missing_dir_ok=True because the
+        # claim folder legitimately doesn't exist until the first video is
+        # ever moved into it — that's normal, not an error.
         try:
-            leftover = mega_list_videos(pid, claim_folder)
-        except Exception:
+            leftover = mega_list_videos(pid, claim_folder, missing_dir_ok=True)
+        except Exception as e:
+            warn(pid, f"Could not check claim folder '{claim_folder}': {e}")
             leftover = []
 
         claimed_file, claimed_match = None, None
