@@ -1,0 +1,211 @@
+name: Facebook Reel Now 1
+
+on:
+  workflow_dispatch:
+    inputs:
+      captions_sheet_id:
+        description: "Google Sheet ID holding Caption / MegaFolder / MegaMoveFolder / LoopIntervalMinutes / MaxRuntimeMinutes (defaults to the shared sheet if left blank)"
+        required: false
+        default: "1aAwd5dY5aozXDtqYZK_SNpd7-mIlZFCndJHZ8A0-lIg"
+        type: string
+      early_requeue_minutes:
+        description: "Minutes after job start to fire the NEXT job (should be a few minutes less than the sheet's MaxRuntimeMinutes, so the new job is already logged in and posting before this one exits)"
+        required: false
+        default: "350"
+        type: string
+
+  # ── Resilient backup trigger ────────────────────────────────────────────
+  # The self-requeue chain (this job triggering the next one via GH_PAT) is
+  # what actually keeps things running 24/7. This cron is just a safety
+  # net: if that chain ever breaks (PAT expired/revoked, a run crashed
+  # before reaching the requeue step, workflow got disabled and
+  # re-enabled, etc.), these 4 scheduled runs/day guarantee the loop can
+  # never stay dead for more than ~6 hours. If the chain is healthy, most
+  # of these will simply find pages already claimed/running and exit
+  # quickly — harmless.
+  schedule:
+    - cron: "0 0,6,12,18 * * *"   # 00:00 / 06:00 / 12:00 / 18:00 UTC — 4x/day
+
+jobs:
+  upload-reel-loop:
+    runs-on: ubuntu-latest
+    # Hard technical ceiling — GitHub kills jobs at 6h (360m) no matter
+    # what on standard hosted runners. 358 leaves just enough room for the
+    # cleanup/upload/requeue steps below to actually finish before that.
+    # Your Google Sheet's MaxRuntimeMinutes should be set a bit LOWER than
+    # this (e.g. 340) so the Python script itself exits cleanly with time
+    # to spare, rather than getting hard-killed mid-post.
+    timeout-minutes: 358
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── 2. Python ────────────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ── 3. Dependencies ──────────────────────────────────────────────────
+      - name: Install Python dependencies
+        run: |
+          pip install playwright schedule \
+                      google-auth google-auth-httplib2 google-api-python-client
+          playwright install chromium --with-deps
+
+      # ── 4. rclone (Mega.nz access) ──────────────────────────────────────
+      - name: Install rclone
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+          rclone version
+
+      - name: Configure rclone (Mega.nz remote)
+        env:
+          RCLONE_CONF_MEGA: ${{ secrets.RCLONE_CONF_MEGA }}
+        run: |
+          if [ -z "$RCLONE_CONF_MEGA" ]; then
+            echo "❌ RCLONE_CONF_MEGA secret is not set — cannot configure the 'mega' remote"
+            exit 1
+          fi
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF_MEGA" > ~/.config/rclone/rclone.conf
+          echo "✅ rclone.conf written (contents hidden)"
+          echo "Configured remotes:"
+          rclone listremotes
+
+      # ── 5. Verify secrets / inputs ───────────────────────────────────────
+      - name: Verify required inputs / secrets
+        env:
+          FB_STORAGE_STATE:        ${{ secrets.FB_STORAGE_STATE }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          RCLONE_CONF_MEGA:        ${{ secrets.RCLONE_CONF_MEGA }}
+        run: |
+          echo "📁 Workspace contents:"
+          ls -lh
+          echo ""
+          echo "Checking secrets…"
+          echo "ℹ️  FB_STORAGE_STATE is now OPTIONAL — it's only used as a one-time"
+          echo "   seed if the 'FbStorageState' cell in the Google Sheet is empty."
+          echo "   Once seeded, the script refreshes the session in the sheet itself"
+          echo "   after every run, so this secret can be left unset going forward."
+          for VAR_NAME in GOOGLE_CREDENTIALS_JSON RCLONE_CONF_MEGA; do
+            VAL="${!VAR_NAME}"
+            if [ -n "$VAL" ]; then
+              echo "✅ $VAR_NAME is set"
+            else
+              echo "❌ $VAR_NAME is MISSING"
+            fi
+          done
+          if [ -n "$FB_STORAGE_STATE" ]; then
+            echo "✅ FB_STORAGE_STATE is set (optional seed)"
+          else
+            echo "ℹ️  FB_STORAGE_STATE is not set — fine as long as the sheet's "
+            echo "   'FbStorageState' cell already has a session in it"
+          fi
+          echo "📝 Captions/settings sheet: ${{ inputs.captions_sheet_id }}"
+          echo "ℹ️  Mega.nz source folder, move folder, loop interval, max runtime,"
+          echo "   URL-replace settings, and the Facebook session are all read from"
+          echo "   the sheet — and now re-read on EVERY post cycle, so edits made"
+          echo "   while this job is running take effect on the next cycle."
+
+      # ── 6. Run the loop, with an EARLY self-requeue ─────────────────────
+      #
+      # The Python script re-reads Settings/Pages from the sheet every
+      # cycle and exits cleanly once MaxRuntimeMinutes (from the sheet)
+      # elapses. Rather than waiting for that exit to trigger the next
+      # job (which left a gap of several minutes with no active session —
+      # exactly what was logging pages out), we start the loop in the
+      # BACKGROUND and, in parallel, fire the next job's workflow_dispatch
+      # after early_requeue_minutes — while THIS job's browser sessions
+      # are still open and posting. By the time this job actually exits,
+      # the next one is already logged in and running, so there is no gap.
+      #
+      - name: Run upload loop (with early self-requeue)
+        env:
+          TZ:                      "Asia/Karachi"
+          FB_STORAGE_STATE:        ${{ secrets.FB_STORAGE_STATE }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          CAPTIONS_SHEET_ID:       ${{ inputs.captions_sheet_id }}
+          GH_TOKEN:                ${{ secrets.GH_PAT }}
+          EARLY_REQUEUE_MINUTES:   ${{ inputs.early_requeue_minutes || '350' }}
+        run: |
+          echo "🔁 Starting loop — timing is controlled by the Google Sheet"
+
+          python -u fbpost2.py &
+          LOOP_PID=$!
+
+          (
+            sleep "$(( EARLY_REQUEUE_MINUTES * 60 ))"
+            if [ -n "$GH_TOKEN" ]; then
+              echo "🔄 [watcher] Requeueing NEXT workflow run early (this run is still active)…"
+              if gh workflow run "${{ github.workflow }}" \
+                  --repo "${{ github.repository }}" \
+                  --ref "${{ github.ref_name }}" \
+                  --field captions_sheet_id="${{ inputs.captions_sheet_id }}" \
+                  --field early_requeue_minutes="${EARLY_REQUEUE_MINUTES}"; then
+                echo "✅ [watcher] Next job queued early — session handoff should be seamless"
+                touch /tmp/already_requeued
+              else
+                echo "⚠️  [watcher] Early requeue failed — the fallback requeue step will retry after this job ends"
+              fi
+            else
+              echo "⚠️  [watcher] GH_PAT not set — early requeue skipped"
+            fi
+          ) &
+          WATCHER_PID=$!
+
+          wait "$LOOP_PID"
+          LOOP_EXIT=$?
+          kill "$WATCHER_PID" 2>/dev/null || true
+          echo "⏹️  Loop window finished (exit code $LOOP_EXIT)"
+          exit "$LOOP_EXIT"
+
+      # ── 7. Upload debug artefacts ─────────────────────────────────────────
+      - name: Upload screenshots & debug files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reel-upload-result-${{ github.run_number }}
+          path: |
+            *.png
+            screenshots/*.png
+            *.html
+          retention-days: 7
+          if-no-files-found: warn
+
+      # ── 8. Self-requeue fallback ────────────────────────────────────────
+      #
+      # Only runs if the EARLY requeue above never fired (e.g. GH_PAT
+      # missing, watcher killed abnormally, job errored out before the
+      # sleep completed). Prevents double-dispatching a duplicate job when
+      # the early requeue already succeeded.
+      #
+      # To STOP the loop entirely: cancel the currently-running job AND
+      # remove GH_PAT from repo secrets (otherwise this step re-queues
+      # another one), or disable the workflow in the Actions UI.
+      #
+      - name: Self-requeue workflow (fallback)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -f /tmp/already_requeued ]; then
+            echo "ℹ️  Already requeued early during the run — skipping fallback requeue"
+            exit 0
+          fi
+          if [ -z "$GH_TOKEN" ]; then
+            echo "⚠️  GH_PAT not set — self-requeue skipped (loop will not continue)"
+            exit 0
+          fi
+
+          echo "🔄 Requeueing workflow (fallback path — early requeue did not run)…"
+          gh workflow run \
+            "${{ github.workflow }}" \
+            --repo "${{ github.repository }}" \
+            --ref "${{ github.ref_name }}" \
+            --field captions_sheet_id="${{ inputs.captions_sheet_id }}" \
+            --field early_requeue_minutes="${{ inputs.early_requeue_minutes || '350' }}"
+
+          echo "✅ Next job queued — loop will continue"
