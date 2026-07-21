@@ -1,0 +1,144 @@
+name: Facebook Reel Upload (Loop)
+
+on:
+  workflow_dispatch:
+    inputs:
+      captions_sheet_id:
+        description: "Google Sheet ID holding Caption / MegaFolder / MegaMoveFolder / LoopIntervalMinutes / MaxRuntimeMinutes (defaults to the shared sheet if left blank)"
+        required: false
+        default: "1aAwd5dY5aozXDtqYZK_SNpd7-mIlZFCndJHZ8A0-lIg"
+        type: string
+
+jobs:
+  upload-reel-loop:
+    runs-on: ubuntu-latest
+    # Hard technical ceiling — GitHub kills jobs at 6 h no matter what.
+    # The script itself exits earlier, based on MaxRuntimeMinutes in the
+    # sheet, and now also self-requeues the NEXT run ~60s before that
+    # window closes — this timeout is just a backstop.
+    timeout-minutes: 330
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── 2. Python ────────────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ── 3. Dependencies ──────────────────────────────────────────────────
+      - name: Install Python dependencies
+        run: |
+          pip install playwright schedule \
+                      google-auth google-auth-httplib2 google-api-python-client
+          playwright install chromium --with-deps
+
+      # ── 4. rclone (Mega.nz access) ──────────────────────────────────────
+      - name: Install rclone
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+          rclone version
+
+      - name: Configure rclone (Mega.nz remote)
+        env:
+          RCLONE_CONF_MEGA: ${{ secrets.RCLONE_CONF_MEGA }}
+        run: |
+          if [ -z "$RCLONE_CONF_MEGA" ]; then
+            echo "❌ RCLONE_CONF_MEGA secret is not set — cannot configure the 'mega' remote"
+            exit 1
+          fi
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF_MEGA" > ~/.config/rclone/rclone.conf
+          echo "✅ rclone.conf written (contents hidden)"
+          rclone listremotes
+
+      # ── 5. Verify secrets / inputs ───────────────────────────────────────
+      - name: Verify required inputs / secrets
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          RCLONE_CONF_MEGA:        ${{ secrets.RCLONE_CONF_MEGA }}
+          GH_PAT:                  ${{ secrets.GH_PAT }}
+        run: |
+          echo "📁 Workspace contents:"
+          ls -lh
+          echo ""
+          for VAR_NAME in GOOGLE_CREDENTIALS_JSON RCLONE_CONF_MEGA; do
+            VAL="${!VAR_NAME}"
+            if [ -n "$VAL" ]; then echo "✅ $VAR_NAME is set"; else echo "❌ $VAR_NAME is MISSING"; fi
+          done
+          if [ -n "$GH_PAT" ]; then
+            echo "✅ GH_PAT is set — jobs will self-requeue back-to-back automatically"
+          else
+            echo "⚠️  GH_PAT is NOT set — the loop will run once and stop (no auto-requeue)"
+          fi
+          echo "📝 Captions/settings sheet: ${{ inputs.captions_sheet_id }}"
+          echo "ℹ️  The sheet is now auto-created/repaired on every run — no manual --setup-sheet needed."
+
+      # ── 6. Run the loop ──────────────────────────────────────────────────
+      #
+      # The Python script self-heals the sheet, reads all timing/config
+      # from it, AND self-requeues the next run via the GitHub API about
+      # 60 seconds before its own MaxRuntimeMinutes window closes — so the
+      # next job is already queued while this one is still finishing up.
+      #
+      - name: Run upload loop
+        env:
+          TZ:                      "Asia/Karachi"
+          FB_STORAGE_STATE:        ${{ secrets.FB_STORAGE_STATE }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          CAPTIONS_SHEET_ID:       ${{ inputs.captions_sheet_id }}
+          GH_PAT:                  ${{ secrets.GH_PAT }}
+          # Must be the actual filename of THIS workflow file under
+          # .github/workflows/ — update if you rename the file.
+          GITHUB_WORKFLOW_FILE:    "facebook-reel-upload-loop.yml"
+        run: |
+          echo "🔁 Starting loop — timing is controlled by the Google Sheet"
+          python fbpost.py
+          echo "⏹️  Loop window finished"
+
+      # ── 7. Upload debug artefacts ─────────────────────────────────────────
+      - name: Upload screenshots & debug files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reel-upload-result-${{ github.run_number }}
+          path: |
+            *.png
+            screenshots/*.png
+            *.html
+          retention-days: 7
+          if-no-files-found: warn
+
+      # ── 8. Self-requeue — FALLBACK ONLY ────────────────────────────────
+      #
+      # Normally fbpost.py already dispatched the next run itself (writes a
+      # `.requeued` marker when it does). This step only fires if that
+      # didn't happen for some reason (e.g. GH_PAT wasn't visible to the
+      # Python step for some reason, or the process was killed early).
+      #
+      # To STOP the loop: cancel the currently-running job before this step
+      # executes, OR remove GH_PAT from your repo secrets.
+      #
+      - name: Self-requeue workflow (fallback)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -f .requeued ]; then
+            echo "✅ Already requeued early from inside the Python run — skipping fallback"
+            exit 0
+          fi
+          if [ -z "$GH_TOKEN" ]; then
+            echo "⚠️  GH_PAT not set — self-requeue skipped (loop will not continue)"
+            exit 0
+          fi
+          echo "🔄 Fallback requeue (python didn't get to it) …"
+          gh workflow run \
+            "${{ github.workflow }}" \
+            --repo "${{ github.repository }}" \
+            --ref "${{ github.ref_name }}" \
+            --field captions_sheet_id="${{ inputs.captions_sheet_id }}"
+          echo "✅ Next job queued"
