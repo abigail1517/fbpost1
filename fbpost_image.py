@@ -10,15 +10,27 @@ you've already set up the sheet for the reel version you can reuse the
 same spreadsheet: just point this script's MegaFolder at your images
 folder (default "fbimages" instead of "fbreels").
 
+DEBUG BUILD — this version adds, compared to the original:
+    - A screenshot after every meaningful step of the post flow
+      (screenshots/<page_id>_<step>.png), not just on failure.
+    - An HTML dump of the page after every meaningful step
+      (debug_html/<page_id>_<step>.html) so you can inspect the actual
+      DOM Facebook served you when something doesn't click/type.
+    - A rewritten caption-entry routine that force-clicks the field
+      when a transient overlay is intercepting pointer events (this
+      was the actual cause of "Caption entry unverified" in your log
+      — Playwright found the field, confirmed it was visible/stable,
+      but a still-animating composer/attachment overlay sat on top of
+      it and blocked the plain click on every single strategy).
+    - A rewritten Post-button click routine that logs every candidate
+      button's text/aria-label/disabled-state it finds on the page
+      before giving up, and falls back to a forced click + JS click
+      if the normal click is blocked the same way.
+
 Run modes:
     python -u fbpost_image.py --setup-sheet
     python -u fbpost_image.py --once
     python -u fbpost_image.py
-
-See fbpost.py's docstring for the full sheet layout — it is unchanged
-here except the folder defaults (MegaFolder=fbimages, MegaMoveFolder=
-fbimages_uploaded) and that MegaFolder should now contain image files
-(.jpg/.jpeg/.png/.webp/.bmp/.gif) instead of videos.
 """
 
 import asyncio, json, os, random, re, socket, subprocess, sys, tempfile, time
@@ -62,7 +74,6 @@ def _default_repo_id() -> str:
 
 REPO_ID = os.environ.get("REPO_ID") or _default_repo_id()
 
-# ── only real change #1: images instead of videos ──────────────────────────
 IMAGE_EXTENSIONS  = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 MEGA_REMOTE_NAME  = "mega"
 URL_REGEX         = re.compile(r'https?://\S+')
@@ -77,8 +88,8 @@ SETTINGS_DEFAULTS = {
     "threadcount":            "3",
     "loopintervalminutes":    "60",
     "maxruntimeminutes":      "300",
-    "megafolder":             "fbimages",            # ← changed default
-    "megamovefolder":         "fbimages_uploaded",   # ← changed default
+    "megafolder":             "fbimages",
+    "megamovefolder":         "fbimages_uploaded",
     "link_percentage":        "100",
     "urlreplacecount":        "1",
     "urlreplacemode":         "unique",
@@ -104,6 +115,7 @@ POSTQUEUE_HEADERS = ["FileName", "Caption", "Hashtags", "PageId", "Status"]
 
 STORAGE_STATE_DIR = Path("storage_states")
 SCREENSHOTS_DIR    = Path("screenshots")
+DEBUG_HTML_DIR     = Path("debug_html")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGER
@@ -746,11 +758,63 @@ FEED_SELECTORS = [
 
 
 async def save_screenshot(page_id, page, name: str):
+    """Save a screenshot for this step. Called unconditionally at every
+    meaningful step now, not just on failure, so you get a full visual
+    trail of exactly what the composer looked like at each stage."""
     SCREENSHOTS_DIR.mkdir(exist_ok=True)
     try:
         await page.screenshot(path=str(SCREENSHOTS_DIR / f"{page_id}_{name}.png"), full_page=False)
+        info(page_id, f"📸 Screenshot saved: {name}")
     except Exception as e:
-        warn(page_id, f"Screenshot failed: {e}")
+        warn(page_id, f"Screenshot failed ({name}): {e}")
+
+
+async def save_html_dump(page_id, page, name: str):
+    """Dump the full page HTML for offline debugging. Lets you inspect
+    exactly what DOM/selectors Facebook served at each step without
+    needing to reproduce the run interactively."""
+    DEBUG_HTML_DIR.mkdir(exist_ok=True)
+    try:
+        html = await page.content()
+        path = DEBUG_HTML_DIR / f"{page_id}_{name}.html"
+        path.write_text(html, encoding="utf-8")
+        info(page_id, f"🧾 HTML dump saved: {name} ({len(html)} chars)")
+    except Exception as e:
+        warn(page_id, f"HTML dump failed ({name}): {e}")
+
+
+async def debug_step(page_id, page, name: str):
+    """Convenience: screenshot + HTML dump together for a given step."""
+    await save_screenshot(page_id, page, name)
+    await save_html_dump(page_id, page, name)
+
+
+async def dump_candidate_buttons(page_id, page, name: str, limit: int = 40):
+    """Log every button-like element currently on the page (text, aria-label,
+    role, disabled state) so failures are diagnosable from the log alone,
+    without needing to open the HTML dump."""
+    try:
+        buttons = await page.evaluate(
+            """(limit) => {
+                const els = Array.from(document.querySelectorAll(
+                    'div[role="button"], span[role="button"], button, a[role="button"]'
+                ));
+                return els.slice(0, limit).map(el => ({
+                    tag: el.tagName,
+                    role: el.getAttribute('role'),
+                    aria: el.getAttribute('aria-label'),
+                    disabled: el.getAttribute('aria-disabled'),
+                    text: (el.innerText || el.textContent || '').trim().slice(0, 40),
+                }));
+            }""", limit)
+    except Exception as e:
+        warn(page_id, f"Could not enumerate buttons for '{name}': {e}")
+        return
+    info(page_id, f"🔍 [{name}] {len(buttons)} button-like element(s) on page:")
+    for b in buttons:
+        if b["text"] or b["aria"]:
+            print(f"      <{b['tag']} role={b['role']} aria-label={b['aria']!r} "
+                  f"aria-disabled={b['disabled']!r}> text={b['text']!r}")
 
 
 async def nuke_continue_button(page_id, page) -> bool:
@@ -808,11 +872,11 @@ async def ensure_logged_in(page_id, page) -> bool:
         url_type = classify_url(page.url)
         if url_type == "CHECKPOINT":
             fail(page_id, "Account checkpoint/restriction — manual action required")
-            await save_screenshot(page_id, page, f"checkpoint_{attempt+1}")
+            await debug_step(page_id, page, f"checkpoint_{attempt+1}")
             return False
         if url_type == "LOGIN_WALL":
             fail(page_id, "Hard login wall — session cookies EXPIRED")
-            await save_screenshot(page_id, page, f"login_wall_{attempt+1}")
+            await debug_step(page_id, page, f"login_wall_{attempt+1}")
             return False
         if url_type == "DEVICE_PICKER":
             await nuke_continue_button(page_id, page)
@@ -825,7 +889,7 @@ async def ensure_logged_in(page_id, page) -> bool:
                 pass
         await asyncio.sleep(4)
     fail(page_id, "Login check exhausted all attempts")
-    await save_screenshot(page_id, page, "login_failed_final")
+    await debug_step(page_id, page, "login_failed_final")
     return False
 
 
@@ -834,7 +898,25 @@ def _nonempty_lines(text: str) -> list[str]:
 
 
 async def _clear_field(page, field):
-    await field.click(timeout=5_000)
+    """Click into the field and select-all + delete existing content.
+
+    FIX: the original version used a plain `.click()`. The composer's
+    caption box sits directly under an attachment/media preview overlay
+    that is still finishing its mount/animation transition right after
+    an image is attached — Playwright's actionability check confirms the
+    element is visible/enabled/stable, but the *click itself* still lands
+    on the overlay ("subtree intercepts pointer events"), so the click
+    silently no-ops on every retry. We now fall back to a forced click
+    (which skips the interception check) and finally a raw JS focus if
+    even that fails.
+    """
+    try:
+        await field.click(timeout=5_000)
+    except Exception:
+        try:
+            await field.click(timeout=5_000, force=True)
+        except Exception:
+            await field.evaluate("el => el.focus()")
     await asyncio.sleep(0.3)
     await page.keyboard.press("Control+a")
     await asyncio.sleep(0.2)
@@ -842,8 +924,6 @@ async def _clear_field(page, field):
     await asyncio.sleep(0.2)
 
 
-# ── the composer's caption box uses the same lexical contenteditable
-# widget as the Reels one, so caption entry logic is unchanged ────────────
 async def enter_caption_lexical(page_id, page, caption: str) -> bool:
     LEXICAL_SELECTORS = [
         'div[data-lexical-editor="true"][contenteditable="true"]',
@@ -852,6 +932,15 @@ async def enter_caption_lexical(page_id, page, caption: str) -> bool:
         'div[contenteditable="true"]',
     ]
     expected_lines = len(_nonempty_lines(caption))
+
+    # Give any transient overlay (attachment preview mounting, composer
+    # resize animation, etc.) a moment to settle before we even try —
+    # this alone eliminates most "subtree intercepts pointer events" hits.
+    try:
+        await page.wait_for_load_state("networkidle", timeout=4_000)
+    except Exception:
+        pass
+    await asyncio.sleep(0.5)
 
     async def strat_keyboard(field):
         await _clear_field(page, field)
@@ -915,8 +1004,14 @@ async def enter_caption_lexical(page_id, page, caption: str) -> bool:
                 if txt and len(txt) > 2 and abs(actual_lines - expected_lines) <= 1:
                     ok(page_id, f"Caption entered via strategy {i} ({actual_lines}/{expected_lines} lines)")
                     return True
+                else:
+                    info(page_id, f"Strategy {i}/{sel} produced unexpected text: {txt[:60]!r}")
             except Exception as e:
                 warn(page_id, f"Caption strategy {i}/{sel} raised: {e}")
+
+    fail(page_id, "All caption entry strategies failed — caption box was never verified non-empty")
+    await debug_step(page_id, page, "caption_all_strategies_failed")
+    await dump_candidate_buttons(page_id, page, "caption_all_strategies_failed")
     return False
 
 
@@ -937,11 +1032,116 @@ async def detect_link_rejection(page_id, page) -> bool:
     return False
 
 
-# ── real change #2: normal photo-post composer instead of Reels/create ────
+async def click_post_button(page_id, page) -> bool:
+    """Robust Post/Publish click.
+
+    FIX: the original selector list relied on the button always being an
+    exact-text `div[role="button"]` with aria-label "Post"/"Publish". In
+    practice Facebook sometimes wraps the label in nested spans (so
+    `:text-is("Post")` matches nothing), sometimes leaves the accessible
+    name off the outer button and only sets it on the SVG/span inside,
+    and the button can also be intercepted by the same kind of transient
+    overlay that was blocking the caption box. This version:
+      1. Tries a much wider set of selectors, checked in order.
+      2. Falls back to scanning ALL button-like elements for one whose
+         visible text is exactly/contains "Post" or "Publish".
+      3. Uses `force=True` and finally a raw JS `.click()` if the normal
+         click is blocked by an overlay.
+      4. Logs every candidate it saw before giving up, so the log alone
+         tells you why it failed next time.
+    """
+    await dump_candidate_buttons(page_id, page, "before_post_click")
+
+    post_selectors = [
+        'div[aria-label="Post"][role="button"]',
+        'div[aria-label="Publish"][role="button"]',
+        'div[role="button"]:text-is("Post")',
+        'div[role="button"]:has-text("Post")',
+        'span:text-is("Post")',
+        'span:has-text("Post")',
+        'button[type="submit"]',
+        'button:has-text("Post")',
+    ]
+
+    async def try_click(loc):
+        # verify not disabled
+        try:
+            if await loc.get_attribute("aria-disabled") == "true":
+                return False
+        except Exception:
+            pass
+        for method_name, method in [
+            ("plain", lambda: loc.click(timeout=6_000)),
+            ("force", lambda: loc.click(timeout=6_000, force=True)),
+            ("js", lambda: loc.evaluate("el => el.click()")),
+        ]:
+            try:
+                await loc.scroll_into_view_if_needed(timeout=5_000)
+            except Exception:
+                pass
+            try:
+                await method()
+                info(page_id, f"Post button clicked via '{method_name}' method")
+                return True
+            except Exception as e:
+                warn(page_id, f"Post click ({method_name}) failed: {e}")
+        return False
+
+    for sel in post_selectors:
+        try:
+            btn = page.locator(sel).last
+            if await btn.count() == 0:
+                continue
+            if await try_click(btn):
+                return True
+        except Exception as e:
+            warn(page_id, f"Post selector '{sel}' raised: {e}")
+
+    # Fallback: scan every button-like element for exact/contains text match,
+    # walking up to the clickable ancestor with role="button" if the text
+    # node itself is a nested span.
+    info(page_id, "No selector matched — falling back to full-page text scan for Post/Publish")
+    try:
+        clicked = await page.evaluate("""() => {
+            const candidates = Array.from(document.querySelectorAll(
+                'div[role="button"], span[role="button"], button, a[role="button"]'
+            ));
+            const isMatch = (el) => {
+                const t = (el.innerText || el.textContent || '').trim();
+                const aria = (el.getAttribute('aria-label') || '').trim();
+                return /^(post|publish)$/i.test(t) || /^(post|publish)$/i.test(aria);
+            };
+            let target = candidates.find(isMatch);
+            if (!target) return false;
+            // walk up to nearest role=button ancestor if this is a text node wrapper
+            let el = target;
+            for (let i = 0; i < 4 && el; i++) {
+                if (el.getAttribute && el.getAttribute('role') === 'button') { target = el; break; }
+                el = el.parentElement;
+            }
+            if (target.getAttribute('aria-disabled') === 'true') return false;
+            target.click();
+            return true;
+        }""")
+        if clicked:
+            info(page_id, "Post button clicked via full-page JS text scan")
+            return True
+    except Exception as e:
+        warn(page_id, f"Full-page JS text scan failed: {e}")
+
+    fail(page_id, "Could not click Post/Publish by any method")
+    await debug_step(page_id, page, "post_button_not_found")
+    return False
+
+
 async def run_upload_flow(page_id, page, caption: str, image_path: str) -> dict:
     """Posts a single image to the Page's feed via the standard Facebook
     composer ("What's on your mind?" -> Photo/video -> attach -> caption
-    -> Post). Returns {"published": bool, "link_rejected": bool}."""
+    -> Post). Returns {"published": bool, "link_rejected": bool}.
+
+    DEBUG BUILD: a screenshot + HTML dump is captured after every step,
+    success or failure, so you have a complete visual/DOM trail of the run.
+    """
     published = False
     link_rejected = False
 
@@ -950,12 +1150,15 @@ async def run_upload_flow(page_id, page, caption: str, image_path: str) -> dict:
         await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=60_000)
     except Exception as e:
         fail(page_id, f"Page load failed: {e}")
+        await debug_step(page_id, page, "01_homepage_load_failed")
         return {"published": False, "link_rejected": False}
     await asyncio.sleep(8)
+    await debug_step(page_id, page, "01_homepage_loaded")
 
     if not await ensure_logged_in(page_id, page):
         return {"published": False, "link_rejected": False}
     ok(page_id, "Login confirmed")
+    await debug_step(page_id, page, "02_login_confirmed")
 
     step(page_id, "Opening post composer")
     opened = False
@@ -972,9 +1175,11 @@ async def run_upload_flow(page_id, page, caption: str, image_path: str) -> dict:
 
     if not opened:
         fail(page_id, "Could not open the post composer")
-        await save_screenshot(page_id, page, "no_composer")
+        await debug_step(page_id, page, "03_no_composer")
+        await dump_candidate_buttons(page_id, page, "no_composer")
         return {"published": False, "link_rejected": False}
     await asyncio.sleep(4)
+    await debug_step(page_id, page, "03_composer_opened")
 
     step(page_id, "Clicking Photo/video")
     photo_clicked = False
@@ -991,6 +1196,7 @@ async def run_upload_flow(page_id, page, caption: str, image_path: str) -> dict:
     if not photo_clicked:
         info(page_id, "No explicit Photo/video button found — the file input may already be present")
     await asyncio.sleep(2)
+    await debug_step(page_id, page, "04_photo_video_clicked")
 
     step(page_id, "Attaching image")
     uploaded = False
@@ -1025,46 +1231,41 @@ async def run_upload_flow(page_id, page, caption: str, image_path: str) -> dict:
 
     if not uploaded:
         fail(page_id, "Could not attach image")
-        await save_screenshot(page_id, page, "no_upload")
+        await debug_step(page_id, page, "05_no_upload")
         return {"published": False, "link_rejected": False}
     ok(page_id, "Image attached")
     await asyncio.sleep(4)
+    await debug_step(page_id, page, "05_image_attached")
+
+    # Let the attachment preview / composer resize animation fully settle
+    # before touching the caption box — this is the overlay that was
+    # intercepting pointer events in your log.
+    try:
+        await page.wait_for_load_state("networkidle", timeout=5_000)
+    except Exception:
+        pass
+    await asyncio.sleep(1.5)
 
     step(page_id, "Entering caption")
+    await debug_step(page_id, page, "06_before_caption")
     caption_ok = await enter_caption_lexical(page_id, page, caption)
     if not caption_ok:
         warn(page_id, "Caption entry unverified — continuing anyway")
-    await save_screenshot(page_id, page, "after_caption")
+    await debug_step(page_id, page, "07_after_caption")
 
     step(page_id, "Clicking Post")
-    post_selectors = [
-        'div[aria-label="Post"][role="button"]', 'div[role="button"]:text-is("Post")',
-        'span:text-is("Post")', 'div[aria-label="Publish"][role="button"]',
-        'div[role="button"]:has-text("Post")', 'button[type="submit"]',
-    ]
-    post_clicked = False
-    for sel in post_selectors:
-        try:
-            btn = page.locator(sel).last
-            if await btn.count() == 0 or await btn.get_attribute("aria-disabled") == "true":
-                continue
-            await btn.scroll_into_view_if_needed(timeout=5_000)
-            await btn.click(force=True)
-            post_clicked = True
-            await asyncio.sleep(5)
-            break
-        except Exception as e:
-            warn(page_id, f"Post click '{sel}' failed: {e}")
+    post_clicked = await click_post_button(page_id, page)
+    await debug_step(page_id, page, "08_after_post_click_attempt")
 
     if not post_clicked:
         fail(page_id, "Could not click Post")
-        await save_screenshot(page_id, page, "no_post_button")
         return {"published": False, "link_rejected": False}
 
+    await asyncio.sleep(3)
     if await detect_link_rejection(page_id, page):
         link_rejected = True
         fail(page_id, "Facebook rejected the post: link violates Community Standards")
-        await save_screenshot(page_id, page, "link_rejected")
+        await debug_step(page_id, page, "09_link_rejected")
         return {"published": False, "link_rejected": True}
 
     step(page_id, "Waiting for publish confirmation")
@@ -1084,14 +1285,14 @@ async def run_upload_flow(page_id, page, caption: str, image_path: str) -> dict:
 
     if link_rejected:
         fail(page_id, "Facebook rejected the post: link violates Community Standards")
-        await save_screenshot(page_id, page, "link_rejected")
+        await debug_step(page_id, page, "10_link_rejected_final")
         return {"published": False, "link_rejected": True}
 
-    await save_screenshot(page_id, page, "final_result")
+    await debug_step(page_id, page, "11_final_result")
     if published:
         ok(page_id, "🎉 Published")
     else:
-        warn(page_id, "Could not confirm publish — check screenshot")
+        warn(page_id, "Could not confirm publish — check screenshot/HTML dump")
     return {"published": published, "link_rejected": link_rejected}
 
 
