@@ -6,7 +6,7 @@ on:
       captions_sheet_id:
         description: "Google Sheet ID holding Caption / MegaFolder / MegaMoveFolder / LoopIntervalMinutes / MaxRuntimeMinutes (defaults to the shared sheet if left blank)"
         required: false
-        default: "1aAwd5dY5aozXDtqYZK_SNpd7-mIlZFCndJHZ8A0-lIg"
+        default: "1RoqxuNbj74jfHCftM0iOuRjHEAlyzJ-pEOR_rYPhaII"
         type: string
 
 jobs:
