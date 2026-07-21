@@ -96,7 +96,7 @@ jobs:
           GITHUB_WORKFLOW_FILE:    "facebook-reel-upload-loop.yml"
         run: |
           echo "🔁 Starting loop — timing is controlled by the Google Sheet"
-          python fbpost.py
+          python fbpostnow1.py
           echo "⏹️  Loop window finished"
 
       # ── 7. Upload debug artefacts ─────────────────────────────────────────
@@ -114,7 +114,7 @@ jobs:
 
       # ── 8. Self-requeue — FALLBACK ONLY ────────────────────────────────
       #
-      # Normally fbpost.py already dispatched the next run itself (writes a
+      # Normally fbpostnow1.py already dispatched the next run itself (writes a
       # `.requeued` marker when it does). This step only fires if that
       # didn't happen for some reason (e.g. GH_PAT wasn't visible to the
       # Python step for some reason, or the process was killed early).
