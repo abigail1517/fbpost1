@@ -789,6 +789,51 @@ async def debug_step(page_id, page, name: str):
     await save_html_dump(page_id, page, name)
 
 
+SHORTCUT_POPUP_SELECTORS = [
+    'div[aria-label="Close"]:near(:text("Keep single-character shortcuts"))',
+    'span:text-is("Keep single-character shortcuts turned on?")',
+    'span:has-text("single-character shortcuts")',
+]
+
+
+async def dismiss_shortcut_popup(page_id, page) -> bool:
+    """Facebook shows a 'Keep single-character shortcuts turned on?' modal
+    whenever a stray keystroke (e.g. a bare '/' from inside a URL typed
+    while the caption box wasn't actually focused) reaches the page body
+    instead of the contenteditable field. Once it appears it sits on top
+    of the composer and blocks every subsequent click/type — which is why
+    caption entry AND the Post click were both failing. We look for it and
+    close it (prefer the explicit 'Turn off' choice so it stops recurring;
+    fall back to the X) before continuing."""
+    try:
+        heading = page.locator('span:has-text("single-character shortcuts")').first
+        if await heading.count() == 0:
+            return False
+    except Exception:
+        return False
+
+    warn(page_id, "Detected 'Keep single-character shortcuts' popup — dismissing it")
+    for sel in ['div[role="button"]:has-text("Turn off")',
+                'span:text-is("Turn off")',
+                '[aria-label="Close"]',
+                'div[role="button"]:has-text("Keep Turned On")']:
+        try:
+            btn = page.locator(sel).first
+            if await btn.count() > 0:
+                await btn.click(timeout=4_000, force=True)
+                await asyncio.sleep(1)
+                return True
+        except Exception:
+            pass
+    # last resort: Escape key
+    try:
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(1)
+    except Exception:
+        pass
+    return True
+
+
 async def dump_candidate_buttons(page_id, page, name: str, limit: int = 40):
     """Log every button-like element currently on the page (text, aria-label,
     role, disabled state) so failures are diagnosable from the log alone,
@@ -910,6 +955,7 @@ async def _clear_field(page, field):
     (which skips the interception check) and finally a raw JS focus if
     even that fails.
     """
+    await dismiss_shortcut_popup(None, page)
     try:
         await field.click(timeout=5_000)
     except Exception:
@@ -918,10 +964,25 @@ async def _clear_field(page, field):
         except Exception:
             await field.evaluate("el => el.focus()")
     await asyncio.sleep(0.3)
+
+    # Verify the field actually has DOM focus before we trust the keyboard.
+    # If it doesn't, a plain/force click landed but didn't focus (common
+    # when an overlay is still covering it) — force focus via JS instead,
+    # which is what actually prevents keystrokes leaking to the page and
+    # triggering the shortcuts popup.
+    try:
+        is_focused = await field.evaluate("el => document.activeElement === el")
+        if not is_focused:
+            await field.evaluate("el => el.focus()")
+            await asyncio.sleep(0.2)
+    except Exception:
+        pass
+
     await page.keyboard.press("Control+a")
     await asyncio.sleep(0.2)
     await page.keyboard.press("Backspace")
     await asyncio.sleep(0.2)
+    await dismiss_shortcut_popup(None, page)
 
 
 async def enter_caption_lexical(page_id, page, caption: str) -> bool:
@@ -999,6 +1060,7 @@ async def enter_caption_lexical(page_id, page, caption: str) -> bool:
                 if await field.count() == 0:
                     continue
                 await strategy(field)
+                await dismiss_shortcut_popup(page_id, page)
                 txt = await field.evaluate("el => (el.innerText || el.textContent || '').trim()")
                 actual_lines = len(_nonempty_lines(txt))
                 if txt and len(txt) > 2 and abs(actual_lines - expected_lines) <= 1:
@@ -1032,6 +1094,60 @@ async def detect_link_rejection(page_id, page) -> bool:
     return False
 
 
+async def click_next_button(page_id, page) -> bool:
+    """Click the 'Next' button that appears after attaching media, before
+    the caption box's real Post step. This mirrors the reel script's
+    attach -> Next -> caption -> Post flow. Only used if a Next button is
+    actually present and enabled — plain single-photo posts sometimes skip
+    straight to a Post button with no Next step at all, so callers must
+    treat a missing Next button as normal, not a failure."""
+    await dismiss_shortcut_popup(page_id, page)
+
+    next_selectors = [
+        'div[aria-label="Next"][role="button"]',
+        'div[role="button"]:text-is("Next")',
+        'div[role="button"]:has-text("Next")',
+        'span:text-is("Next")',
+        'button:has-text("Next")',
+    ]
+
+    found_any = False
+    for sel in next_selectors:
+        try:
+            btn = page.locator(sel).first
+            if await btn.count() == 0:
+                continue
+            found_any = True
+            if await btn.get_attribute("aria-disabled") == "true":
+                info(page_id, f"Next button ('{sel}') present but disabled — not ready yet")
+                continue
+            for method_name, method in [
+                ("plain", lambda: btn.click(timeout=6_000)),
+                ("force", lambda: btn.click(timeout=6_000, force=True)),
+                ("js", lambda: btn.evaluate("el => el.click()")),
+            ]:
+                try:
+                    await btn.scroll_into_view_if_needed(timeout=5_000)
+                except Exception:
+                    pass
+                try:
+                    await method()
+                    info(page_id, f"Next button clicked via '{method_name}' method")
+                    await asyncio.sleep(3)
+                    await dismiss_shortcut_popup(page_id, page)
+                    return True
+                except Exception as e:
+                    warn(page_id, f"Next click ({method_name}) failed: {e}")
+        except Exception as e:
+            warn(page_id, f"Next selector '{sel}' raised: {e}")
+
+    if not found_any:
+        info(page_id, "No Next button found — this composer may go straight to Post")
+    else:
+        warn(page_id, "Next button found but could not be clicked by any method")
+    return False
+
+
 async def click_post_button(page_id, page) -> bool:
     """Robust Post/Publish click.
 
@@ -1050,6 +1166,7 @@ async def click_post_button(page_id, page) -> bool:
       4. Logs every candidate it saw before giving up, so the log alone
          tells you why it failed next time.
     """
+    await dismiss_shortcut_popup(page_id, page)
     await dump_candidate_buttons(page_id, page, "before_post_click")
 
     post_selectors = [
@@ -1245,6 +1362,7 @@ async def run_upload_flow(page_id, page, caption: str, image_path: str) -> dict:
     except Exception:
         pass
     await asyncio.sleep(1.5)
+    await dismiss_shortcut_popup(page_id, page)
 
     step(page_id, "Entering caption")
     await debug_step(page_id, page, "06_before_caption")
@@ -1253,7 +1371,38 @@ async def run_upload_flow(page_id, page, caption: str, image_path: str) -> dict:
         warn(page_id, "Caption entry unverified — continuing anyway")
     await debug_step(page_id, page, "07_after_caption")
 
+    # This composer uses a two-step flow, same as the reels script: after
+    # attaching media (and, per the screenshots, entering the caption in
+    # the box already visible at this stage) there is a "Next" button —
+    # NOT a Post button yet. Clicking Post here was failing because there
+    # was no Post button on screen at all; it only appears on the screen
+    # that follows Next. A plain single-photo post sometimes skips Next
+    # entirely, so we only click it if it's actually present/enabled.
+    step(page_id, "Checking for Next button")
+    next_clicked = await click_next_button(page_id, page)
+    await debug_step(page_id, page, "07b_after_next_click" if next_clicked else "07b_no_next_button")
+
+    if next_clicked:
+        # The Next screen occasionally re-renders the caption box empty —
+        # verify and re-enter if so, rather than assuming it carried over.
+        try:
+            existing = await page.evaluate("""() => {
+                const el = document.querySelector('div[data-lexical-editor="true"][contenteditable="true"]')
+                         || document.querySelector('div[contenteditable="true"]');
+                return el ? (el.innerText || el.textContent || '').trim() : '';
+            }""")
+        except Exception:
+            existing = ""
+        if len(existing) < 2:
+            info(page_id, "Caption box empty after Next — re-entering caption")
+            await dismiss_shortcut_popup(page_id, page)
+            caption_ok = await enter_caption_lexical(page_id, page, caption)
+            if not caption_ok:
+                warn(page_id, "Caption entry unverified on post-Next screen — continuing anyway")
+            await debug_step(page_id, page, "07c_caption_after_next")
+
     step(page_id, "Clicking Post")
+    await dismiss_shortcut_popup(page_id, page)
     post_clicked = await click_post_button(page_id, page)
     await debug_step(page_id, page, "08_after_post_click_attempt")
 
